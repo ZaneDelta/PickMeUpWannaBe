@@ -159,8 +159,13 @@ GM_efektif = GM + 0.5 bila punya perk Late Bloomer dan level >= 30
 
 ## 7. Floor Climbing / Tower (NO ESCAPE)
 
-- Level musuh lantai = `2 x floor` (F1 → L2, F5 → L10, F20 → L40).
-- **Boss floor tiap kelipatan 5**: boss + 2 minion (level boss−2).
+- Level musuh lantai biasa = `2 x floor` (F2 → L4, F3 → L6).
+- **Boss floor tiap kelipatan 5**: **boss = `3 x floor`** + 2 minion =
+  `2 x floor` (permintaan user: boss lebih menakutkan). Contoh: F5 →
+  boss L15 + 2 minion L10; F10 → boss L30 + 2 minion L20; F80 → boss
+  L240 + 2 minion L160. Header lantai menampilkan level boss.
+- Catatan balance: modifier boss (HP ×2.4, ATK ×1.35) di atas level 3F
+  membuat boss floor jauh lebih keras dari lantai biasa.
 - **NO ESCAPE absolut** — `BattleEngine(can_escape=False)`, battle wajib
   berakhir Victory atau Total Party Permadeath (draw ronde 50 = kalah).
 - Lantai clear bisa diulang (farm) tanpa batas.
@@ -169,7 +174,8 @@ GM_efektif = GM + 0.5 bila punya perk Late Bloomer dan level >= 30
 
 ### Reward Tower
 
-- Coins `35 x (2F)`, XP `36 x (2F)` per hero hidup.
+- Coins `35 x (2F)`, XP `36 x (2F)` per hero hidup (berbasis floor, bukan
+  level boss).
 - Gem dijamin di floor kelipatan 5; 12% floor lainnya.
 - Equipment: F%10 → 100% epic (tier 3–5); F%5 → 55% rare (tier 3–4);
   F%10 → +1 Core.
@@ -257,12 +263,18 @@ GM_efektif = GM + 0.5 bila punya perk Late Bloomer dan level >= 30
 
 ---
 
-## 10. Lobby & Auto-Heal
+## 10. Lobby & Auto-Heal (HP + MP)
 
 - Menu utama bernama **LOBBY** (bukan "Menu Utama").
-- **Auto-heal**: setiap kali masuk/kembali ke Lobby, SEMUA hero hidup
-  pulih penuh (`auto_heal_lobby()` — HP penuh via `h.refresh()`).
+- **Auto-restore**: setiap kali masuk/kembali ke Lobby, SEMUA hero hidup
+  pulih penuh — **HP penuh DAN MP/mana penuh** (`auto_heal_lobby()`:
+  `h.refresh()` + `h.mana = h.max_mp`). Saat masuk battle berikutnya
+  hero sudah membawa MP maksimal (permintaan user: mana TIDAK direset 0
+  lagi). Notifikasi `[Lobby] N hero ter-restore penuh (HP & MP)` hanya
+  tampil bila ada yang perlu di-restore.
   Tidak ada menu Heal/Rest — fitur itu SUDAH DIHAPUS (jangan dibuat ulang).
+- Di dalam battle: skill tetap menghabiskan mana & regen per ronde
+  (3–8/ronde per class) tetap berjalan — restore penuh hanya di Lobby.
 - Tampilan Lobby: coins/gems/hero hidup/floor tertinggi, party N/5, status
   Tas Battle, menu 1–9.
 - **Party maks 5 hero** (`PARTY_MAX = 5`, ditegakkan di `Party.add`).
@@ -370,6 +382,8 @@ Daftar ini adalah permintaan eksplisit user — melanggarnya = regresi:
 10. **Jangan menampilkan prompt kabur tiap ronde.**
 11. **Jangan membuat jumlah monster Adventure pasti** (harus acak 1–3;
     Hidden Boss tetap 1 unit).
+11b. **Jangan ubah formula level Tower**: biasa 2×floor; boss floor =
+    boss 3×floor + 2 minion 2×floor.
 12. **Jangan pakai deepcopy/list() pada battle_bag** yang dipindahkan ke
     BattleEngine (harus referensi langsung).
 13. **Jangan menaruh stat master di savegame** atau data pemain di database
@@ -450,7 +464,7 @@ import main as M
 | `SaveSystem` | save/load JSON + migrasi + backup .bak |
 | `deep_merge`, `ensure_hero_fields` | util migrasi |
 | `Game.__init__(username)` | boot: init_db, load, hero cache, settings |
-| `Game.run` | loop Lobby (auto-heal di awal tiap iterasi) |
+| `Game.run` | loop Lobby (auto-restore HP+MP di awal tiap iterasi) |
 | `auto_heal_lobby`, `battle_capacity`, `battle_bag` | fitur Lobby |
 | `gacha_menu`, `do_gacha`, `announce` | gacha (tanpa persen di UI) |
 | `manage_hero_menu` → `hero_menu` → `hero_detail_menu` | Manage Hero |
@@ -458,7 +472,7 @@ import main as M
 | `inventory_menu` → `item_detail_flow` | Inventory + opsi T (tas) |
 | `battle_bag_flow`, `_try_use_battle_item` (BattleEngine) | Tas Battle + AI |
 | `adventure` | sesi adventure + tabel encounter rahasia |
-| `tower_menu`, `tower_floor`, `reward_tower` | Tower NO ESCAPE |
+| `tower_menu`, `tower_floor`, `reward_tower` | Tower NO ESCAPE (boss 3F + minion 2F) |
 | `promotion_menu(hero=None)` | star promotion 1→7 |
 | `craft_menu` | crafting raw → soulstone |
 | `shop_menu` | potion, gacha ticket, mystery box (TANPA material) |

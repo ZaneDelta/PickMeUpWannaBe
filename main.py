@@ -1794,19 +1794,24 @@ class Game:
         heroes = self.pre_battle_check()
         if not heroes:
             return
-        # Level musuh tower: 2F (F1 -> L2, F5 boss -> L10, F20 -> L40).
-        # Rumus lama 3+2F membuat F1 (L5 x3) bunuh pasti party L1 baru —
-        # deadlock material promosi; 2F tetap menanjak tajam di lantai atas.
-        lev = max(1, 2 * floor)
+        # Level musuh tower:
+        #   lantai biasa  = 2 x floor (F2 -> L4, F3 -> L6)
+        #   BOSS floor (kelipatan 5) = boss 3 x floor + 2 minion 2 x floor
+        #   (permintaan user: boss lebih menakutkan, minion tetap 2F)
         is_boss_floor = (floor % 5 == 0)
+        if is_boss_floor:
+            lev = max(1, 3 * floor)          # level BOSS
+        else:
+            lev = max(1, 2 * floor)          # level musuh biasa
         header("TOWER FLOOR %d%s — Musuh L%d" % (floor, " [BOSS]" if is_boss_floor else "", lev))
         print("  (!) TIDAK ADA OPSI KABUR. Battle hanya selesai jika satu")
         print("      pihak tumbang total. Hero gugur = mati permanen.")
         enemies = []
         if is_boss_floor:
-            # Boss + 2 minion di kelipatan 5; boss HP lebih besar
+            # Boss (3xF) + 2 minion (2xF) di kelipatan 5; boss HP lebih besar
             enemies.append(Enemy.make(level=lev, mode="tower", boss=True))
-            enemies += [Enemy.make(level=max(1, lev - 2), mode="tower") for _ in range(2)]
+            enemies += [Enemy.make(level=max(1, 2 * floor), mode="tower")
+                        for _ in range(2)]
         else:
             enemies = [Enemy.make(level=lev, mode="tower") for _ in range(3)]
         for e in enemies:
