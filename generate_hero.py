@@ -400,9 +400,9 @@ class Hero:
                 self.cls, "*" * self.star, self.level, self.xp, self.xp_needed()),
             "Status : %s" % ("HIDUP" if self.alive else "GUGUR"),
             "Perks  : %s" % (", ".join(self.perks) if self.perks else "(tidak ada)"),
-            "HP %d/%d  ATK %d  DEF %d  SPD %d  MP %d  (regen %d/ronde)" % (
+            "HP %d/%d  ATK %d  DEF %d  SPD %d  MP %d/%d  (regen %d/ronde)" % (
                 self.hp, self.max_hp, self.atk, self.dfn, self.spd,
-                int(self.mana), self.mp_regen),
+                int(self.mana), self.max_mp, self.mp_regen),
             "Equip  : %s" % ("; ".join(eqs) if eqs else "(kosong)"),
         ]
 

@@ -1141,17 +1141,23 @@ class Game:
     # --------------------------- utama (LOBBY) ---------------------------
     def auto_heal_lobby(self):
         """Fitur otomatis: setiap kali kembali ke Lobby, SEMUA hero pulih
-        sepenuhnya (HP penuh, mana direset). Menggantikan menu Heal/Rest."""
+        penuh — HP penuh DAN MP/mana penuh. Saat masuk battle berikutnya
+        semua hero sudah membawa MP maksimal (permintaan user: mana tidak
+        direset 0 lagi, tapi di-restore di Lobby)."""
         r = self.roster()
-        healed = [h.name for h in r.values() if h.alive and h.hp < h.max_hp]
+        restored = []
+        for h in r.values():
+            if h.alive and (h.hp < h.max_hp or h.mana < h.max_mp):
+                restored.append(h.name)
         for h in r.values():
             if h.alive:
                 h.refresh()
-        if healed:
-            print("  [Lobby] %d hero pulih sepenuhnya (auto-heal): %s" % (
-                len(healed), ", ".join(n[:20] for n in healed[:5]) +
-                ("..." if len(healed) > 5 else "")))
-        return len(healed)
+                h.mana = h.max_mp   # MP penuh saat masuk battle
+        if restored:
+            print("  [Lobby] %d hero ter-restore penuh (HP & MP): %s" % (
+                len(restored), ", ".join(n[:20] for n in restored[:5]) +
+                ("..." if len(restored) > 5 else "")))
+        return len(restored)
 
     def battle_capacity(self):
         """Kapasitas Tas Battle = 2 x jumlah hero di party (maks party 5
