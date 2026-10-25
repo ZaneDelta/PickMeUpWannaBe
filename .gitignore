@@ -1,0 +1,7 @@
+# Abaikan semua folder __pycache__ dan isinya
+__pycache__/
+*.pyc
+
+# Abaikan semua isi folder saves, tapi tetap pertahankan foldernya
+saves/*
+!saves/.gitkeep
