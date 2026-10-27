@@ -65,7 +65,7 @@ Ini konsep TERPENTING untuk dipahami sebelum menyentuh kode:
 
 | Lapisan | Isi | Lokasi | Saat update versi |
 |---|---|---|---|
-| **Master data** | nama hero (31.104 kombinasi), 16 perk, 48 item master, stat 6 class, multiplier star 1–7 | tabel SQLite | dikosongkan & **di-seed ulang otomatis** dari konstanta di `database_setup.py` — selalu kembali lengkap |
+| **Master data** | nama hero (31.104 kombinasi), 48 traits (tabel `perks`), 240 skills (180 class + 60 universal), 48 item master, konstanta stat & bobot 6 class, pita probabilitas star 1–7 | tabel SQLite & konstanta seed | dikosongkan & **di-seed ulang otomatis** dari konstanta di `database_setup.py` — selalu kembali lengkap |
 | **Data pemain** | inventory, equipment, Tas Battle, roster hero, coins/gems, progres tower, pengaturan | `saves/<username>.json` | **tidak pernah disentuh** patcher |
 | **Akun** | username, hash password, salt | tabel `accounts` SQLite | tidak pernah disentuh `force` |
 
@@ -112,20 +112,52 @@ dbs.backup_db()                         # salin db ke .bak (best-effort)
   growth multiplier (GM) 1,5–2,5x + peluang perk Rare/Legendary ekstra.
   Canon: 1★ bisa melampaui 4★/5★ — **star awal bukan batas kekuatan**.
 - **Anti-duplikat ketat**: roster di-key by NAMA, jadi (a) nama wajib unik
-  (`gen.names`), (b) fingerprint `(nama, growth_tuple, perks)` wajib unik
+  (`gen.names`), (b) fingerprint `(nama, base_tuple, growth_tuple, traits, skills)` wajib unik
   (`gen.fingerprints`). 200 percobaan lalu fallback suffix serial `[N]`.
   `gen.register_existing(roster)` dipanggil saat load — JANGAN lewatkan,
   kalau tidak, hero hasil gacha bisa menimpa hero lama.
-- Perk per hero: 1–3 (HARD CAP 3 di semua jalur, termasuk bonus 5★/hidden).
-- Tier perk: Common 60 / Rare 30 / Epic 9 / Legendary 1 (maks 1 Legendary
-  per hero). Pool & tier hidup di tabel `perks`.
-- Data stat hero: tabel `class_stats` (base & growth per class) x
-  `star_mults` (multiplier per star 1–7). Formula:
+- **Keunikan Penuh Per Hero (Traits, Skills Class + Universal, & Stat Random)**:
+  - **Traits per hero (dahulu Perks)**: 1–3 acak (HARD CAP 3 di semua jalur, termasuk bonus 5★/hidden) dari pool **48 Traits** di tabel `perks` (`TRAITS`).
+    Tier trait: Common 60 / Rare 30 / Epic 9 / Legendary 1 (maks 1 Legendary
+    per hero). **RAHASIA: tier trait tidak pernah ditampilkan di UI pemain.**
+  - **Skills per hero (240 Total Pool = 180 Class + 60 Universal)**:
+    - **Pool Class**: 30 skill khusus untuk masing-masing dari 6 class (`Tanker`, `Dealer`, `Archer`, `Healer`, `Buffer`, `Mage` = `30 × 6 = 180` skill). Skill `Taunt` (dan seluruh variasi provokasi/aggro) **HANYA** ada di pool `Tanker` dan tidak pernah masuk Universal.
+    - **Pool Universal**: 60 skill universal yang bisa dipelajari class apa pun (tanpa `Taunt`).
+    - **Roll per hero**: tiap hero mendapat **1–2 skill sesuai class-nya** + **0–3 skill Universal** tergantung keberuntungan (dan tier Common 60 / Rare 30 / Epic 9 / Legendary 1). **RAHASIA: tier skill tidak pernah ditampilkan di UI pemain.**
+  - **Stat Dasar (`base_stats`) & Rise Rate (`growth_stats`) Random per hero**:
+    - **Base Stat (`base_stats`)**:
+      - Batas **minimum** tiap stat berbeda-beda per class (`STAT_BASE_MIN_BY_CLASS`), sedangkan batas **maksimum** tiap stat **SAMA** untuk semua class dan semua star (`STAT_BASE_MAX`):
+
+| Class | HP (Min – Max) | ATK (Min – Max) | DEF (Min – Max) | SPD (Min – Max) | MP (Min – Max) |
+|---|---|---|---|---|---|
+| **Tanker** | `150.0 – 260.0` | `9.0 – 32.0` | `13.0 – 24.0` | `7.0 – 18.0` | `25.0 – 90.0` |
+| **Dealer** | `110.0 – 260.0` | `15.0 – 32.0` | `7.0 – 24.0` | `10.0 – 18.0` | `20.0 – 90.0` |
+| **Archer** | `95.0 – 260.0` | `14.0 – 32.0` | `5.0 – 24.0` | `12.0 – 18.0` | `22.0 – 90.0` |
+| **Healer** | `105.0 – 260.0` | `8.0 – 32.0` | `7.0 – 24.0` | `9.0 – 18.0` | `45.0 – 90.0` |
+| **Buffer** | `115.0 – 260.0` | `9.0 – 32.0` | `8.0 – 24.0` | `11.0 – 18.0` | `40.0 – 90.0` |
+| **Mage** | `85.0 – 260.0` | `17.0 – 32.0` | `4.0 – 24.0` | `8.0 – 18.0` | `50.0 – 90.0` |
+
+      - Distribusi peluang miring (*skewed* 5 pita `STAT_BANDS` berukuran `20%` per pita + kurva pangkat `u ** 1.25` di dalam pita): **makin tinggi nilai stat, makin kecil persentase peluangnya**.
+      - Makin tinggi star grade (`STAR_STAT_BAND_WEIGHTS`), makin besar persentase peluang mendapat stat tinggi/sangat tinggi.
+    - **Rise Rate Stat per Level (`growth_stats`)**:
+      - Batas **minimum dan maksimum** rise rate tiap naik level **SAMA** untuk semua star dan semua class (`STAT_GROWTH_RANGE`: HP `+8.0..26.0`, ATK `+0.8..3.0`, DEF `+0.5..1.6`, SPD `+0.15..0.45`, MP `+1.5..6.0`).
+      - Yang berbeda antar star **HANYA persentase peluang** mendapat rise rate bagus (`STAR_GROWTH_BAND_WEIGHTS`). Hero 1★ tetap bisa mendapat rise rate maksimum, namun persentasenya sangat kecil (`0.8%` masuk pita 80–100%, dan `~0.10%` menyentuh puncak maksimum):
+
+| Star | Pita 1 (0–20%) | Pita 2 (20–40%) | Pita 3 (40–60%) | Pita 4 (60–80%) | Pita 5 / Puncak (80–100%) |
+|---|---|---|---|---|---|
+| **1★** | `58.0%` | `26.0%` | `11.0%` | `4.2%` | `0.8%` |
+| **2★** | `48.0%` | `27.5%` | `15.0%` | `7.5%` | `2.0%` |
+| **3★** | `39.0%` | `27.0%` | `19.0%` | `11.0%` | `4.0%` |
+| **4★** | `31.0%` | `25.5%` | `21.5%` | `15.0%` | `7.0%` |
+| **5★** | `25.0%` | `23.0%` | `21.0%` | `18.5%` | `12.5%` |
+| **6★** | `22.5%` | `21.5%` | `20.5%` | `19.0%` | `16.5%` |
+| **7★** | `21.2%` | `20.6%` | `20.0%` | `19.4%` | `18.8%` |
+
+    - Formula stat per level:
 
 ```
-stat = base[cls]*star_base_mult + growth[cls]*star_growth_mult
-       * (level-1) * GM_efektif
-GM_efektif = GM + 0.5 bila punya perk Late Bloomer dan level >= 30
+stat = base_hero[idx] + growth_hero[idx] * (level-1) * GM_efektif
+GM_efektif = GM + 0.3 (Chosen One) + 0.5 (Late Bloomer pada level >= 30)
 ```
 
 - XP: `xp_needed = round(40 * level^1.5)`, carry-over, MAX_LEVEL 99.
@@ -212,6 +244,7 @@ GM_efektif = GM + 0.5 bila punya perk Late Bloomer dan level >= 30
   jangan hapus). Material & sacrifice hilang saat GAGAL, coins −50%.
 - Sacrifice hero (tier ≥4): jumlah = target − 3 (4★→1, ..., 7★→4).
   Hero yang diorban HILANG PERMANEN (roster.pop + drop_hero_cache).
+- Saat promosi sukses, `hero.promote_star(target)` dipanggil untuk menaikkan bintang sekaligus me-reroll/meningkatkan `base_stats` dan `growth_stats` mengikuti distribusi persentase star baru (tetap dibatasi maksimum universal `STAT_BASE_MAX` & `STAT_GROWTH_RANGE`).
 - Akses dari 2 tempat: Tower menu 3 (pilih hero dari daftar) dan
   Detail Hero → "3. Promote Star" (hero langsung ditentukan, target =
   star+1). Satu fungsi: `promotion_menu(hero=None)`.
@@ -287,19 +320,11 @@ GM_efektif = GM + 0.5 bila punya perk Late Bloomer dan level >= 30
   dulu, lalu urutan masuk). `ROUND_CAP = 50` — draw dihitung KALAH.
 - **Damage = max(1, ATK_total − DEF_total)** dikali variance (1 − k),
   k ~ U(0,05; 0,10) — serangan selalu sedikit lemah dari nilai mentah.
-- **AI per class** (fallback attack jika MP kurang):
-  - Tanker: Taunt (10 MP, 2 ronde, DEF +30%) → Shield Bash (15 MP, 1.2x,
-    stun 15%) → attack musuh pertama
-  - Dealer: Power Strike (20 MP, 1.8x) → attack; target = musuh HP
-    terendah (tie: ATK terbesar)
-  - Archer: Piercing Shot (18 MP, ignore DEF) → attack (target sama)
-  - Healer: Mass Heal (45 MP, ≥2 ally HP<50%) → Heal (25 MP, ally HP<50%
-    paling kritis, 2xATK+25) → attack
-  - Buffer: Attack Hymn (20 MP, ATK+30% party 3 ronde) → Guard Hymn
-    (DEF+25%) → attack
-  - Mage: channel sampai MP cukup → Meteor (60 MP, AoE 2.0x + stun 25%)
-    → Fireball (30 MP, AoE 0.75x + stun 10%) → Frost Nova (40 MP, AoE
-    0.5x + slow). Double Cast: 15% AoE gratis.
+- **AI berbasis skill unik hero (`use_hero_skill`)** (fallback basic attack jika MP kurang / cooldown) — mendukung seluruh 240 skill secara dinamis berdasarkan `kind`:
+  - Prioritas 1 (Heal): `mass_heal` (≥2 ally HP < 60%) → `heal` (1 ally HP < 60% paling kritis)
+  - Prioritas 2 (Tank): `taunt` (khusus pool class `Tanker`, paksa aggro musuh 2 ronde & buff DEF)
+  - Prioritas 3 (Buff Party): `buff_all` (buff ATK + DEF + SPD party) → `buff_atk` (buff ATK party) → `buff_def` (buff DEF party)
+  - Prioritas 4 (Ofensif / AoE / CC): dipilih skor dampak tertinggi dari `aoe_cc` (AoE + stun/slow), `aoe` (serangan seluruh musuh), `stun_hit` (single-target + peluang stun), `drain` (serangan + lifesteal HP), `pierce` (serangan abaikan DEF), dan `single` (burst single-target). Trait `Double Cast` (20%) & `Infinite Mana` (+15%) memberi peluang pakai skill tanpa menguras MP; Trait `Overcharge` memperkuat damage skill +30% saat MP > 70%.
 - **AI musuh**: serang Tanker yang sedang Taunt dulu, selain itu random.
   Caster: 50% splash 50% dmg ke hero acak lain.
 - **Permadeath**: HP hero 0 = mati PERMANEN. Urutan penyelamat:
@@ -344,7 +369,7 @@ GM_efektif = GM + 0.5 bila punya perk Late Bloomer dan level >= 30
 
 ## 13. Database (database_setup.py)
 
-Tabel: `hero_names` (31.104 baris), `perks` (16), `items_master` (48),
+Tabel: `hero_names` (31.104 baris), `perks` (48 traits), `skills` (240 skills = 180 class + 60 universal), `items_master` (48),
 `class_stats` (6), `star_mults` (7), `accounts`, `meta`.
 
 - **Seeding idempotent**: `INSERT OR IGNORE` + PRIMARY KEY/UNIQUE teks.
@@ -371,6 +396,7 @@ Daftar ini adalah permintaan eksplisit user — melanggarnya = regresi:
 3. **Jangan menampilkan Hidden Potential** (label tier, angka GM, marker
    hasil gacha). Mekaniknya bekerja diam-diam; pemain tidak boleh tahu
    hero mana yang istimewa.
+3b. **Jangan menampilkan tier dari Traits maupun Skills** (Common/Rare/Epic/Legendary) di UI pemain — tier bersifat rahasia dan hanya untuk bobot roll internal.
 4. **Jangan menghapus progres pemain saat update** — tidak boleh ada kode
    yang menghapus savegame/akun otomatis; migrasi harus selalu additive.
 5. **Jangan menjamin drop raw boss material** (harus 5% murni).

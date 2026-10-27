@@ -19,9 +19,11 @@ import time
 from datetime import datetime
 
 import database_setup as dbs
-from generate_hero import (Hero, Equipment, Perk, HeroGenerator, GachaSystem,
+from generate_hero import (Hero, Equipment, Perk, Trait, Skill, HeroGenerator, GachaSystem,
                            weighted_choice, _safe_int, MAX_LEVEL, MAX_STAR,
-                           CLASSES, EQUIP_SLOTS)
+                           CLASSES, EQUIP_SLOTS, roll_random_base_stats,
+                           roll_random_growth_stats, roll_random_mp_regen,
+                           roll_random_skills)
 
 VERSION = "2.2.0"
 GAME_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -60,6 +62,8 @@ def action_delay():
 # Data game yang kini disimpan di database SQLite:
 PROMO_TABLE = dbs.PROMO_TABLE       # biaya Star Promotion 1->7 (eksponensial)
 PERKS = dbs.load_perks()            # {nama: (tier, deskripsi)} dari tabel perks
+TRAITS = PERKS                      # alias resmi Traits (dahulu Perks)
+SKILLS = dbs.load_skills()          # {nama: {cls, tier, mp_cost, cd, kind, mult, description}}
 TIER_LABEL = dbs.TIER_LABEL
 STAR_MULTS = dbs.load_star_mults()  # {star: (base_mult, growth_mult)}
 
@@ -336,9 +340,9 @@ class BattleEngine:
         if not hero.alive:
             return 0
         # Guardian: hero NON-taunter yang punya perk ini dapat DEF +25%
-        # selama ada Tanker lain yang sedang menarik perhatian (taunt aktif)
+        # selama ada ally lain yang sedang menarik perhatian (taunt aktif)
         dfn_eff = hero.dfn
-        taunters = [t for t in self.living_heroes() if t.taunt_turns > 0 and t.cls == "Tanker"]
+        taunters = [t for t in self.living_heroes() if t.taunt_turns > 0]
         if taunters and hero is not taunters[0] and hero.has("Guardian"):
             dfn_eff = int(round(dfn_eff * 1.25))
         dmg = self.calc_damage(raw_atk, dfn_eff)
@@ -369,7 +373,7 @@ class BattleEngine:
         if hero.has("Phoenix") and not hero.used_phoenix:
             hero.used_phoenix = True
             hero.hp = max(1, hero.max_hp // 2)
-            self.say("    *** PERK PHOENIX! %s bangkit dari kematian (HP 50%%) ***" % hero.name)
+            self.say("    *** TRAIT PHOENIX! %s bangkit dari kematian (HP 50%%) ***" % hero.name)
             return
         hero.alive = False
         hero.hp = 0
@@ -391,7 +395,8 @@ class BattleEngine:
 
     # ------------------------- aksi hero -------------------------
     def hero_act(self, h):
-        """State machine sederhana per class. MP kurang -> fallback attack."""
+        """AI Hero berbasis skill unik yang dimiliki hero (h.skills),
+        tidak lagi dikunci oleh class. MP kurang / cooldown -> fallback attack."""
         enemies = self.living_enemies()
         if not enemies:
             return
@@ -404,19 +409,12 @@ class BattleEngine:
         # lebih bernilai dipakai sekarang (lihat _try_use_battle_item).
         if self._try_use_battle_item(h):
             return
-        cls = h.cls
-        if cls == "Tanker":
-            self.act_tanker(h, enemies)
-        elif cls == "Dealer":
-            self.act_dealer(h, enemies)
-        elif cls == "Archer":
-            self.act_dealer(h, enemies)  # AI identik: fokus HP terendah
-        elif cls == "Healer":
-            self.act_healer(h)
-        elif cls == "Buffer":
-            self.act_buffer(h)
-        elif cls == "Mage":
-            self.act_mage(h, enemies)
+        # Coba gunakan skill unik milik hero yang siap (cukup MP & tidak cooldown)
+        if self.use_hero_skill(h, enemies):
+            return
+        # Fallback: serangan dasar ke musuh prioritas
+        target = min(enemies, key=lambda e: (e.hp, -e.atk))
+        self.basic_attack(h, target)
 
     # ------------------------- AI: TAS BATTLE -------------------------
     def _try_use_battle_item(self, h):
@@ -473,111 +471,233 @@ class BattleEngine:
             return True
         return False
 
-    def act_tanker(self, h, enemies):
-        # AI Tanker: Taunt jika habis, lalu Shield Bash (stun), else attack.
-        if h.taunt_turns <= 0 and h.mana >= 10 and (h.skill_cd.get("Taunt", 0) <= 0):
-            h.mana -= 10
-            h.skill_cd["Taunt"] = 3
-            h.taunt_turns = 2
-            h.buff_def = 30  # DEF +30% selama taunt aktif
-            self.say("  [R%d] %s menaikkan perisai: TAUNT! (musuh dipaksa menarget)" % (self.round, h.name))
-            return
-        if h.mana >= 15 and h.skill_cd.get("Shield Bash", 0) <= 0:
-            h.mana -= 15
-            h.skill_cd["Shield Bash"] = 4
-            target = enemies[0]
-            dmg = self.calc_damage(int(h.atk * 1.2), target.dfn)
-            self.say("  [R%d] %s: SHIELD BASH ke %s" % (self.round, h.name, target.name))
-            # Stun 15% base; gagal jika DEF target > ATK Tanker (guard kuat)
-            if target.dfn <= h.atk and random.random() < 0.15:
+    def use_hero_skill(self, h, enemies):
+        """Evaluasi dan jalankan skill dari h.skills yang siap (off-cooldown & MP cukup).
+        Urutan prioritas AI cerdas:
+          1. Heal / Cleanse darurat (Mass Heal bila >=2 ally luka, Cleanse/Heal bila ally luka/stun)
+          2. Taunt (khusus skill class Tanker bila belum ada taunt aktif pada diri sendiri)
+          3. Buff party / Mana gift (War Cry / Attack / Guard / Speed / Mana Chorus)
+          4. Skill ofensif / AoE / CC terkuat yang siap dipakai
+        Return True bila skill digunakan, False bila tidak ada yang dipakai."""
+        skills = getattr(h, "skills", None) or []
+        if not skills:
+            return False
+        ready = []
+        for sk_name in skills:
+            info = SKILLS.get(sk_name)
+            if not info:
+                continue
+            eff_cost = h.skill_mp_cost(info["mp_cost"]) if hasattr(h, "skill_mp_cost") else info["mp_cost"]
+            if h.skill_cd.get(sk_name, 0) <= 0 and h.mana >= eff_cost:
+                ready.append((sk_name, info, eff_cost))
+        if not ready:
+            return False
+
+        allies = self.living_heroes()
+        wounded = [a for a in allies if a.hp < a.max_hp * 0.60]
+        stunned_allies = [a for a in allies if a.stun_turns > 0]
+
+        # 1) Mass Heal, Cleanse Heal, & Single Heal
+        for sk_name, info, eff_cost in ready:
+            if info["kind"] == "mass_heal" and len(wounded) >= 2:
+                h.mana -= eff_cost
+                h.skill_cd[sk_name] = info["cd"]
+                amount = int(info["mult"] * h.atk + 15)
+                self.say("  [R%d] %s: %s (%d HP semua ally)" % (
+                    self.round, h.name, sk_name.upper(), amount))
+                for a in allies:
+                    self.heal_unit(h, a, amount)
+                return True
+        for sk_name, info, eff_cost in ready:
+            if info["kind"] == "cleanse_heal" and (wounded or stunned_allies):
+                h.mana -= eff_cost
+                h.skill_cd[sk_name] = info["cd"]
+                cands = stunned_allies if stunned_allies else wounded
+                target = min(cands, key=lambda a: a.hp / a.max_hp)
+                target.stun_turns = 0
+                amount = int(info["mult"] * h.atk + 20)
+                self.say("  [R%d] %s: %s ke %s (pulih & murnikan stun)" % (
+                    self.round, h.name, sk_name.upper(), target.name))
+                self.heal_unit(h, target, amount)
+                return True
+        for sk_name, info, eff_cost in ready:
+            if info["kind"] == "heal" and wounded:
+                h.mana -= eff_cost
+                h.skill_cd[sk_name] = info["cd"]
+                target = min(wounded, key=lambda a: a.hp / a.max_hp)
+                amount = int(info["mult"] * h.atk + 25)
+                self.say("  [R%d] %s: %s ke %s" % (
+                    self.round, h.name, sk_name.upper(), target.name))
+                self.heal_unit(h, target, amount)
+                return True
+
+        # 2) Taunt (hanya dimiliki pool class Tanker)
+        for sk_name, info, eff_cost in ready:
+            if info["kind"] == "taunt" and h.taunt_turns <= 0:
+                h.mana -= eff_cost
+                h.skill_cd[sk_name] = info["cd"]
+                h.taunt_turns = 2
+                def_bonus = int(info["mult"]) if info["mult"] >= 10 else 30
+                h.buff_def = max(h.buff_def, def_bonus)
+                self.say("  [R%d] %s: %s! (musuh dipaksa menarget, DEF +%d%%)" % (
+                    self.round, h.name, sk_name.upper(), def_bonus))
+                return True
+
+        # 3) Buff party & Mana Gift
+        atk_active = any(a.buff_atk > 0 for a in allies)
+        def_active = any(a.buff_def > 0 for a in allies)
+        spd_active = any(a.buff_spd > 0 for a in allies)
+        low_mp_allies = [a for a in allies if a.mana < a.max_mp * 0.65]
+        for sk_name, info, eff_cost in ready:
+            if info["kind"] == "buff_all" and (not atk_active or not spd_active):
+                h.mana -= eff_cost
+                h.skill_cd[sk_name] = info["cd"]
+                pct = int(info["mult"])
+                self.say("  [R%d] %s: %s! ATK +%d%% & SPD +20%% party (3 ronde)" % (
+                    self.round, h.name, sk_name.upper(), pct))
+                for a in allies:
+                    a.buff_atk = max(a.buff_atk, pct)
+                    a.buff_spd = max(a.buff_spd, 20)
+                return True
+            if info["kind"] == "buff_atk" and not atk_active:
+                h.mana -= eff_cost
+                h.skill_cd[sk_name] = info["cd"]
+                pct = int(info["mult"])
+                self.say("  [R%d] %s: %s! ATK party +%d%% (3 ronde)" % (
+                    self.round, h.name, sk_name.upper(), pct))
+                for a in allies:
+                    a.buff_atk = max(a.buff_atk, pct)
+                return True
+            if info["kind"] == "buff_def" and not def_active:
+                h.mana -= eff_cost
+                h.skill_cd[sk_name] = info["cd"]
+                pct = int(info["mult"])
+                self.say("  [R%d] %s: %s! DEF party +%d%% (3 ronde)" % (
+                    self.round, h.name, sk_name.upper(), pct))
+                for a in allies:
+                    a.buff_def = max(a.buff_def, pct)
+                return True
+            if info["kind"] == "buff_spd" and not spd_active:
+                h.mana -= eff_cost
+                h.skill_cd[sk_name] = info["cd"]
+                pct = int(info["mult"])
+                self.say("  [R%d] %s: %s! SPD party +%d%% (3 ronde)" % (
+                    self.round, h.name, sk_name.upper(), pct))
+                for a in allies:
+                    a.buff_spd = max(a.buff_spd, pct)
+                return True
+            if info["kind"] == "mana_gift" and low_mp_allies:
+                h.mana -= eff_cost
+                h.skill_cd[sk_name] = info["cd"]
+                mp_amt = int(info["mult"])
+                self.say("  [R%d] %s: %s! (+%d MP ke seluruh party)" % (
+                    self.round, h.name, sk_name.upper(), mp_amt))
+                for a in allies:
+                    a.mana = min(a.max_mp, a.mana + mp_amt)
+                return True
+
+        # 4) Skill ofensif (urutkan dari dampak / MP cost terbesar)
+        off_kinds = ("aoe_stun", "aoe_pierce", "aoe_slow", "pierce", "drain", "stun", "single")
+        off_ready = [(s, inf, c) for s, inf, c in ready if inf["kind"] in off_kinds]
+        if not off_ready:
+            return False
+        off_ready.sort(key=lambda x: (-x[1]["mp_cost"], -x[1]["mult"]))
+        sk_name, info, eff_cost = off_ready[0]
+        kind = info["kind"]
+        mult = info["mult"]
+        # Trait Overcharge: saat MP > 70% sebelum cast, damage skill +30%
+        if h.has("Overcharge") and h.max_mp > 0 and h.mana > h.max_mp * 0.70:
+            mult *= 1.30
+        cost = eff_cost
+        label = sk_name.upper()
+
+        # AoE skills (mendukung trait Double Cast untuk semua hero)
+        if kind.startswith("aoe"):
+            if h.has("Double Cast") and random.random() < 0.15:
+                cost = 0
+                label += " (Double Cast: gratis!)"
+            h.mana -= cost
+            h.skill_cd[sk_name] = info["cd"]
+            tier_s = info.get("tier", "Common")
+            stun_c = 0.0
+            if kind == "aoe_stun":
+                stun_c = 0.25 if tier_s == "Legendary" else (0.18 if tier_s == "Epic" else 0.12)
+            is_slow = (kind == "aoe_slow")
+            ignore_def = (kind == "aoe_pierce")
+            self.cast_aoe(h, mult, label, stun_chance=stun_c, slow=is_slow, ignore_def=ignore_def)
+            return True
+
+        # Single-target offensive skills
+        h.mana -= cost
+        h.skill_cd[sk_name] = info["cd"]
+        target = min(enemies, key=lambda e: (e.hp, -e.atk))
+        base_atk, note = self.atk_with_perks(h, target)
+        eff_dfn = 0 if kind == "pierce" else target.dfn
+        dmg = self.calc_damage(int(base_atk * mult), eff_dfn)
+        extra = " (ignore DEF)" if kind == "pierce" else ""
+        self.say("  [R%d] %s: %s%s ke %s%s" % (
+            self.round, h.name, label, extra, target.name, note))
+        if kind == "stun":
+            tier_s = info.get("tier", "Common")
+            stun_rate = 0.35 if tier_s in ("Epic", "Legendary") else (0.25 if tier_s == "Rare" else 0.20)
+            if random.random() < stun_rate:
                 target.stun_turns = 1
                 self.say("    !! %s terkena STUN 1 ronde!" % target.name)
-            self.apply_damage_to_enemy(target, dmg, h.name)
-            return
-        self.basic_attack(h, enemies[0])
-
-    def act_dealer(self, h, enemies):
-        # AI Dealer/Archer: fokus musuh HP terendah (execute/prioritas ancaman).
-        # Tie-break: musuh dengan ATK terbesar lebih dulu dihabisi (ancaman).
-        target = min(enemies, key=lambda e: (e.hp, -e.atk))
-        if h.cls == "Archer" and h.mana >= 18 and h.skill_cd.get("Piercing Shot", 0) <= 0:
-            # Piercing Shot: ignore DEF sepenuhnya
-            h.mana -= 18
-            h.skill_cd["Piercing Shot"] = 2
-            dmg = self.calc_damage(int(h.atk * 1.5), 0)
-            self.say("  [R%d] %s: PIERCING SHOT (ignore DEF) ke %s" % (self.round, h.name, target.name))
-            self.apply_damage_to_enemy(target, dmg, h.name)
-            return
-        if h.cls == "Dealer" and h.mana >= 20 and h.skill_cd.get("Power Strike", 0) <= 0:
-            h.mana -= 20
-            h.skill_cd["Power Strike"] = 3
-            dmg = self.calc_damage(int(h.atk * 1.8), target.dfn)
-            self.say("  [R%d] %s: POWER STRIKE ke %s" % (self.round, h.name, target.name))
-            self.apply_damage_to_enemy(target, dmg, h.name)
-            return
-        dmg_base = self.atk_with_perks(h, target)
-        self.basic_attack(h, target, dmg_base)
+        self.apply_damage_to_enemy(target, dmg, h.name)
+        if kind == "drain" and h.alive:
+            drain_hp = max(1, int(dmg * 0.40))
+            before = h.hp
+            h.hp = min(h.max_hp, h.hp + drain_hp)
+            self.say("    ++ %s menyerap %d HP (%d/%d)" % (
+                h.name, h.hp - before, h.hp, h.max_hp))
+        return True
 
     def atk_with_perks(self, h, target):
-        """Hitung ATK efektif + label perk ofensif (Focused Fire/Executioner).
+        """Hitung ATK efektif + label trait ofensif (Focused Fire/Executioner/dll).
         Return tuple (atk_int, label_string) untuk log battle."""
         a = h.atk
         note = ""
         if h.has("Focused Fire"):
-            a = int(a * 1.2)
+            a = int(a * 1.20)
             note += " [Focused Fire]"
+        if target and target.hp > target.max_hp * 0.80 and h.has("First Strike"):
+            a = int(a * 1.25)
+            note += " [First Strike]"
+        if target and (target.boss or target.elite) and h.has("Giant Slayer"):
+            a = int(a * 1.25)
+            note += " [Giant Slayer]"
+        if target and target.boss and h.has("Godslayer"):
+            a = int(a * 1.30)
+            note += " [Godslayer]"
         if target and target.hp < target.max_hp * 0.25 and h.has("Executioner"):
-            a = int(a * 1.5)
+            a = int(a * 1.50)
             note += " [EXECUTE]"
         return a, note
 
     def basic_attack(self, h, target, atk_override=None):
-        """Serangan fisik biasa dengan semua pengecekan perk ofensif."""
+        """Serangan fisik biasa dengan semua pengecekan trait ofensif."""
         if atk_override is not None:
             a, note = atk_override if isinstance(atk_override, tuple) else (atk_override, "")
         else:
             a, note = self.atk_with_perks(h, target)
-        # Unlucky: 15% serangan meleset (kompensasi ATK+40% sudah diberikan)
-        if h.has("Unlucky") and random.random() < 0.15:
+        # Unlucky: 15% serangan meleset (kecuali punya Precision)
+        if h.has("Unlucky") and not h.has("Precision") and random.random() < 0.15:
             self.say("  [R%d] %s: serangan MELESET! %s" % (self.round, h.name, note))
             return
         dmg = self.calc_damage(a, target.dfn)
         self.say("  [R%d] %s menyerang %s%s" % (self.round, h.name, target.name, note))
         self.apply_damage_to_enemy(target, dmg, h.name)
-        # Vampiric: heal diri 20% dari damage fisik yang di-deal
-        if h.has("Vampiric") and h.alive:
-            heal = max(1, int(dmg * 0.2))
+        # Vampiric (20%) & Bloodthirst (10%): lifesteal dari serangan fisik
+        lifesteal_pct = (0.20 if h.has("Vampiric") else 0.0) + (0.10 if h.has("Bloodthirst") else 0.0)
+        if lifesteal_pct > 0 and h.alive:
+            heal = max(1, int(dmg * lifesteal_pct))
             h.hp = min(h.max_hp, h.hp + heal)
-            self.say("    ~~ Vampiric: %s pulih %d HP" % (h.name, heal))
-
-    def act_healer(self, h):
-        """AI Healer: heal ally HP<50% terendah; Mass Heal jika >=2 ally
-        sekarat; kalau tidak ada yang sakit -> serang musuh HP terendah."""
-        allies = self.living_heroes()
-        wounded = [a for a in allies if a.hp < a.max_hp * 0.5]
-        if h.mana >= 45 and h.skill_cd.get("Mass Heal", 0) <= 0 and len(wounded) >= 2:
-            h.mana -= 45
-            h.skill_cd["Mass Heal"] = 5
-            amount = int(1.2 * h.atk + 15)
-            self.say("  [R%d] %s: MASS HEAL (%d HP semua ally)" % (self.round, h.name, amount))
-            for a in allies:
-                self.heal_unit(h, a, amount)
-            return
-        if h.mana >= 25 and h.skill_cd.get("Heal", 0) <= 0 and wounded:
-            h.mana -= 25
-            h.skill_cd["Heal"] = 2
-            target = min(wounded, key=lambda a: a.hp / a.max_hp)
-            amount = int(2 * h.atk + 25)
-            self.say("  [R%d] %s: HEAL ke %s" % (self.round, h.name, target.name))
-            self.heal_unit(h, target, amount)
-            return
-        # Tidak ada yang perlu diheal -> serang
-        enemies = self.living_enemies()
-        if enemies:
-            self.basic_attack(h, min(enemies, key=lambda e: e.hp))
+            self.say("    ~~ Lifesteal: %s pulih %d HP" % (h.name, heal))
 
     def heal_unit(self, healer, target, amount):
-        """Heal dengan perk Miracle Hand (+30%, 10% crit heal x2)."""
+        """Heal dengan trait Miracle Hand (+30%, 10% crit heal x2) & Celestial Grace (+25%)."""
+        if healer.has("Celestial Grace") or target.has("Celestial Grace"):
+            amount = int(amount * 1.25)
         if healer.has("Miracle Hand"):
             amount = int(amount * 1.3)
             if random.random() < 0.10:
@@ -588,68 +708,12 @@ class BattleEngine:
         self.say("    ++ %s pulih %d HP (%d/%d)" % (
             target.name, target.hp - before, target.hp, target.max_hp))
 
-    def act_buffer(self, h):
-        """AI Buffer: pasang buff yang belum aktif (ATK dulu, lalu DEF);
-        kalau semua buff aktif -> serang."""
-        allies = self.living_heroes()
-        atk_active = any(a.buff_atk > 0 for a in allies)
-        def_active = any(a.buff_def > 0 for a in allies)
-        if not atk_active and h.mana >= 20 and h.skill_cd.get("Attack Hymn", 0) <= 0:
-            h.mana -= 20
-            h.skill_cd["Attack Hymn"] = 3
-            self.say("  [R%d] %s: ATTACK HYMN! ATK party +30%% (3 ronde)" % (self.round, h.name))
-            for a in allies:
-                a.buff_atk = 30
-            return
-        if not def_active and h.mana >= 20 and h.skill_cd.get("Guard Hymn", 0) <= 0:
-            h.mana -= 20
-            h.skill_cd["Guard Hymn"] = 3
-            self.say("  [R%d] %s: GUARD HYMN! DEF party +25%% (3 ronde)" % (self.round, h.name))
-            for a in allies:
-                a.buff_def = 25
-            return
-        enemies = self.living_enemies()
-        if enemies:
-            self.basic_attack(h, min(enemies, key=lambda e: e.hp))
-
-    def act_mage(self, h, enemies):
-        """AI Mage: channel (kumpulkan mana via regen), saat MP penuh
-        lepas AoE ke SEMUA musuh + peluang CC stun. Lalu channel lagi."""
-        if h.mana >= h.max_mp or (h.mana >= 60 and random.random() < 0.5):
-            # Pilih nuke terbesar yang terjangkau (Meteor > Fireball)
-            if h.mana >= 60 and h.skill_cd.get("Meteor", 0) <= 0:
-                cost, mult, label = 60, 2.0, "METEOR"
-                if h.has("Double Cast") and random.random() < 0.15:
-                    cost = 0
-                    label += " (Double Cast: gratis!)"
-                h.mana -= cost
-                h.skill_cd["Meteor"] = 6
-                self.cast_aoe(h, mult, label, stun_chance=0.25)
-            elif h.mana >= 30 and h.skill_cd.get("Fireball", 0) <= 0:
-                cost, mult, label = 30, 0.75, "FIREBALL"
-                if h.has("Double Cast") and random.random() < 0.15:
-                    cost = 0
-                    label += " (Double Cast: gratis!)"
-                h.mana -= cost
-                h.skill_cd["Fireball"] = 2
-                self.cast_aoe(h, mult, label, stun_chance=0.10)
-            elif h.mana >= 40 and h.skill_cd.get("Frost Nova", 0) <= 0:
-                h.mana -= 40
-                h.skill_cd["Frost Nova"] = 4
-                self.cast_aoe(h, 0.5, "FROST NOVA", stun_chance=0.0, slow=True)
-            else:
-                # MP belum cukup untuk skill manapun -> channel (tahan posisi)
-                self.say("  [R%d] %s meng-channel mana... (%d/%d)" % (
-                    self.round, h.name, int(h.mana), h.max_mp))
-        else:
-            self.say("  [R%d] %s meng-channel mana... (%d/%d)" % (
-                self.round, h.name, int(h.mana), h.max_mp))
-
-    def cast_aoe(self, h, mult, label, stun_chance=0.0, slow=False):
-        """AoE mage: hit SEMUA musuh + peluang stun/slow per musuh."""
+    def cast_aoe(self, h, mult, label, stun_chance=0.0, slow=False, ignore_def=False):
+        """AoE skill: hit SEMUA musuh + peluang stun/slow/ignore DEF per musuh."""
         self.say("  [R%d] %s melepaskan %s! (AoE semua musuh)" % (self.round, h.name, label))
         for e in self.living_enemies():
-            dmg = self.calc_damage(int(h.atk * mult), e.dfn)
+            eff_dfn = 0 if ignore_def else e.dfn
+            dmg = self.calc_damage(int(h.atk * mult), eff_dfn)
             self.apply_damage_to_enemy(e, dmg, "%s [%s]" % (h.name, label))
             if e.alive and stun_chance > 0 and random.random() < stun_chance:
                 e.stun_turns = 1
@@ -669,8 +733,8 @@ class BattleEngine:
             e.stun_turns -= 1
             self.say("  [R%d] %s STUN, giliran dilewati." % (self.round, e.name))
             return
-        # Prioritas: Tanker dengan taunt aktif
-        taunters = [h for h in heroes if h.taunt_turns > 0 and h.cls == "Tanker"]
+        # Prioritas: hero manapun dengan taunt aktif
+        taunters = [h for h in heroes if h.taunt_turns > 0]
         target = random.choice(heroes) if not taunters else taunters[0]
         dmg = self.calc_damage(e.atk, target.dfn)
         self.say("  [R%d] %s menyerang %s" % (self.round, e.name, target.name))
@@ -715,15 +779,20 @@ class BattleEngine:
                 self.result = "lose"
                 break
         if not self.result:
-            # End of round: regen MP, tick buffs/cooldowns
+            # End of round: regen MP, trait HP regen, tick buffs/cooldowns
             for h in self.living_heroes():
                 h.mana = min(h.max_mp, h.mana + h.mp_regen)
+                regen_pct = (0.05 if h.has("Vitality Aura") else 0.0) + \
+                            (0.08 if h.has("Immortal Vessel") else 0.0)
+                if regen_pct > 0 and h.hp < h.max_hp:
+                    h.hp = min(h.max_hp, h.hp + max(1, int(h.max_hp * regen_pct)))
                 if h.taunt_turns > 0:
                     h.taunt_turns -= 1
                     if h.taunt_turns == 0:
                         h.buff_def = 0  # buff taunt hilang bersama taunt
                 h.buff_atk = max(0, h.buff_atk - 10) if h.buff_atk > 0 else 0
                 h.buff_def = max(0, h.buff_def - 10) if h.buff_def > 0 and h.taunt_turns <= 0 else h.buff_def
+                h.buff_spd = max(0, h.buff_spd - 10) if h.buff_spd > 0 else 0
                 for k in list(h.skill_cd):
                     h.skill_cd[k] = max(0, h.skill_cd[k] - 1)
             for e in self.living_enemies():
@@ -1007,23 +1076,58 @@ def deep_merge(default, old):
 
 def ensure_hero_fields(hd):
     """Migrasi 1 hero: field baru yang tidak ada di save lama diisi default
-    (growth_multiplier, perks, equipment, alive, blueprints, dll)."""
+    (growth_multiplier, perks, skills, base_stats, growth_stats, mp_regen,
+    equipment, alive, blueprints, dll)."""
+    name = str(hd.get("name") or "Tanpa Nama")
+    star = max(1, min(MAX_STAR, _safe_int(hd.get("star"), 1)))
+    gm = float(hd.get("growth_multiplier", 1.0) or 1.0)
+    hero_cls = hd.get("cls") or hd.get("class") or "Dealer"
+    if hero_cls not in CLASSES:
+        hero_cls = "Dealer"
+    mig_rng = random.Random("pmu_hero_mig::" + name)
+    raw_bs = hd.get("base_stats")
+    if isinstance(raw_bs, (list, tuple)) and len(raw_bs) == 5:
+        try:
+            base_stats = [float(x) for x in raw_bs]
+        except Exception:
+            base_stats = list(roll_random_base_stats(hero_cls, star, mig_rng))
+    else:
+        base_stats = list(roll_random_base_stats(hero_cls, star, mig_rng))
+    raw_gs = hd.get("growth_stats")
+    if isinstance(raw_gs, (list, tuple)) and len(raw_gs) == 5:
+        try:
+            growth_stats = [float(x) for x in raw_gs]
+        except Exception:
+            growth_stats = list(roll_random_growth_stats(star, mig_rng))
+    else:
+        growth_stats = list(roll_random_growth_stats(star, mig_rng))
+    raw_mpr = hd.get("mp_regen")
+    mp_regen_val = _safe_int(raw_mpr, 0) if raw_mpr is not None else 0
+    if mp_regen_val <= 0:
+        mp_regen_val = roll_random_mp_regen(star, mig_rng)
+    raw_skills = [s for s in (hd.get("skills") or []) if s in SKILLS]
+    if not raw_skills:
+        raw_skills = roll_random_skills(hero_cls, star, gm >= 1.5, mig_rng)
+    raw_traits = hd.get("traits") if hd.get("traits") is not None else (hd.get("perks") or [])
+    valid_traits = [p for p in raw_traits if p in PERKS]
     defaults = {
-        "name": hd.get("name") or "Tanpa Nama",
-        "star": max(1, min(MAX_STAR, _safe_int(hd.get("star"), 1))),
-        "cls": hd.get("cls") or hd.get("class") or "Dealer",
+        "name": name,
+        "star": star,
+        "cls": hero_cls,
         "level": max(1, _safe_int(hd.get("level"), 1)),
         "xp": _safe_int(hd.get("xp"), 0),
-        "growth_multiplier": float(hd.get("growth_multiplier", 1.0) or 1.0),
-        "perks": list(hd.get("perks") or []),
+        "growth_multiplier": gm,
+        "traits": list(valid_traits),
+        "perks": list(valid_traits),
+        "skills": raw_skills,
+        "base_stats": base_stats,
+        "growth_stats": growth_stats,
+        "mp_regen": mp_regen_val,
         "equipment": hd.get("equipment") or {"Senjata": None, "Zirah": None, "Aksesori": None},
         "alive": bool(hd.get("alive", True)),
         "hp": _safe_int(hd.get("hp"), 0),
         "blueprints": _safe_int(hd.get("blueprints"), 0),
     }
-    if defaults["cls"] not in CLASSES:
-        defaults["cls"] = "Dealer"
-    defaults["perks"] = [p for p in defaults["perks"] if p in PERKS]
     out = dict(hd)
     for k, v in defaults.items():
         out.setdefault(k, v)   # setdefault = TIDAK menimpa nilai lama yang valid
@@ -1031,6 +1135,12 @@ def ensure_hero_fields(hd):
     out["star"] = defaults["star"]
     out["level"] = defaults["level"]
     out["growth_multiplier"] = defaults["growth_multiplier"]
+    out["traits"] = defaults["traits"]
+    out["perks"] = defaults["perks"]
+    out["skills"] = defaults["skills"]
+    out["base_stats"] = defaults["base_stats"]
+    out["growth_stats"] = defaults["growth_stats"]
+    out["mp_regen"] = defaults["mp_regen"]
     return out
 
 
@@ -1254,12 +1364,14 @@ class Game:
 
     def announce(self, h):
         tag = {"Mage": " (!) MAGE LANGKA!", "Healer": " (healer)"}.get(h.cls, "")
-        # RAHASIA: tidak ada penanda hidden potential di hasil gacha —
-        # pemain tidak diberi tahu bila hero membawa growth multiplier
-        # tersembunyi. Bedanya baru terasa seiring hero bertumbuh.
-        print("  [%s] %s %s%s | Perks: %s" % (
+        # RAHASIA: tidak ada penanda hidden potential maupun tier traits/skills
+        # di hasil gacha — pemain hanya melihat nama trait & skill yang didapat.
+        traits_list = getattr(h, "traits", None) or getattr(h, "perks", None) or []
+        print("  [%s] %s %s%s | HP:%d ATK:%d DEF:%d SPD:%d | Traits: %s | Skills: %s" % (
             "*" * h.star, h.name, h.cls, tag,
-            ", ".join(h.perks) if h.perks else "-"))
+            h.max_hp, h.atk, h.dfn, h.spd,
+            ", ".join(traits_list) if traits_list else "-",
+            ", ".join(h.skills) if getattr(h, "skills", None) else "-"))
         sleep(0.25)
 
     # ======================= MANAGE HERO (v2.0) =======================
@@ -1319,16 +1431,33 @@ class Game:
             header("DETAIL HERO")
             for ln in h.detail_lines():
                 print("  " + ln)
-            # Skill list class (data hardcoded AI battle)
-            skills = {
-                "Tanker": "Taunt (10 MP, taunt 2 ronde) | Shield Bash (15 MP, stun 15%)",
-                "Dealer": "Power Strike (20 MP, 1.8x ATK)",
-                "Archer": "Piercing Shot (18 MP, ignore DEF)",
-                "Healer": "Heal (25 MP) | Mass Heal (45 MP, semua ally)",
-                "Buffer": "Attack Hymn (20 MP, ATK+30%) | Guard Hymn (20 MP, DEF+25%)",
-                "Mage":   "Fireball (30 MP, AoE) | Frost Nova (40 MP, AoE+slow) | Meteor (60 MP, AoE 2.0x + stun)",
-            }.get(h.cls, "-")
-            print("  Skill  : %s" % skills)
+            # Detail tiap Trait milik hero (TANPA menampilkan tier — tier rahasia!)
+            print("\n  Detail Traits Hero:")
+            traits_list = getattr(h, "traits", None) or getattr(h, "perks", None) or []
+            if traits_list:
+                for idx_t, tr_name in enumerate(traits_list, 1):
+                    t_info = TRAITS.get(tr_name)
+                    if t_info:
+                        print("   %d. %-18s : %s" % (idx_t, tr_name, t_info[1]))
+                    else:
+                        print("   %d. %s" % (idx_t, tr_name))
+            else:
+                print("   (tidak ada trait)")
+            # Detail tiap Skill milik hero (TANPA menampilkan tier — tier rahasia!)
+            print("\n  Detail Skill Hero:")
+            if getattr(h, "skills", None):
+                for idx_s, sk_name in enumerate(h.skills, 1):
+                    sinfo = SKILLS.get(sk_name)
+                    if sinfo:
+                        eff_mp = h.skill_mp_cost(sinfo["mp_cost"]) if hasattr(h, "skill_mp_cost") else sinfo["mp_cost"]
+                        origin = sinfo.get("cls", "Universal")
+                        print("   %d. %-18s [%s | %d MP | CD %d] : %s" % (
+                            idx_s, sk_name, origin, eff_mp,
+                            sinfo["cd"], sinfo["description"]))
+                    else:
+                        print("   %d. %s" % (idx_s, sk_name))
+            else:
+                print("   (tidak ada skill)")
             print("\n  Equipment terpasang:")
             slots = list(h.equipment.keys())
             for i, s in enumerate(slots, 1):
@@ -1983,11 +2112,14 @@ class Game:
             self.party.remove(s.name)
             print("  %s telah diorban..." % s.name)
         if random.random() < rate:
-            hero.star = target
+            if hasattr(hero, "promote_star"):
+                hero.promote_star(target)
+            else:
+                hero.star = target
+                hero.refresh()
             self.state["pity"][str(target)] = 0
-            print("  *** SUKSES! %s kini %s! Batas statnya terbuka. ***" % (
+            print("  *** SUKSES! %s kini %s! Batas stat & rise-rate meningkat. ***" % (
                 hero.name, "*" * target))
-            hero.refresh()
         else:
             self.state["pity"][str(target)] = pity + 1
             print("  ...GAGAL. Material & sacrifice hilang, coins -50%%. Pity +%d%%." %

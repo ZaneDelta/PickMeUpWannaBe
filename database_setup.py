@@ -67,32 +67,433 @@ MP_REGEN = {"Tanker": 4, "Dealer": 3, "Archer": 3, "Healer": 8, "Buffer": 7, "Ma
 CLASS_GACHA_WEIGHT = {"Tanker": 20, "Dealer": 20, "Archer": 20,
                       "Healer": 20, "Buffer": 20, "Mage": 3}
 
+# ==================== RANDOMISASI STAT & RISE RATE ====================
+# Aturan baru randomisasi stat dasar (base_stats):
+#   1. Batas MAKSIMUM tiap stat SAMA untuk semua class dan semua star.
+#   2. Batas MINIMUM tiap stat BERBEDA-BEDA per class sesuai spesialisasi
+#      (misal Tanker punya minimum DEF & HP lebih tinggi dibanding Dealer,
+#      sedangkan Dealer/Mage punya minimum ATK lebih tinggi).
+#   3. Makin tinggi nilai stat, makin kecil persentase peluang mendapatkannya.
+#   4. Makin tinggi star grade hero, makin besar peluang mendapat stat sangat tinggi.
+STAT_KEYS = ("hp", "atk", "def", "spd", "mp")
+
+# Maksimum stat dasar UNIVERSAL (sama untuk semua class & semua star)
+STAT_BASE_MAX = {
+    "hp":  260.0,
+    "atk":  32.0,
+    "def":  24.0,
+    "spd":  18.0,
+    "mp":   90.0,
+}
+
+# Minimum stat dasar BERBEDA per class & per stat
+STAT_BASE_MIN_BY_CLASS = {
+    "Tanker": {"hp": 150.0, "atk":  9.0, "def": 13.0, "spd":  7.0, "mp": 25.0},
+    "Dealer": {"hp": 110.0, "atk": 15.0, "def":  7.0, "spd": 10.0, "mp": 20.0},
+    "Archer": {"hp":  95.0, "atk": 14.0, "def":  5.0, "spd": 12.0, "mp": 22.0},
+    "Healer": {"hp": 105.0, "atk":  8.0, "def":  7.0, "spd":  9.0, "mp": 45.0},
+    "Buffer": {"hp": 115.0, "atk":  9.0, "def":  8.0, "spd": 11.0, "mp": 40.0},
+    "Mage":   {"hp":  85.0, "atk": 17.0, "def":  4.0, "spd":  8.0, "mp": 50.0},
+}
+
+# Fallback global range (min terendah lintas class s/d max universal)
+STAT_BASE_RANGE = {
+    "hp":  (85.0,  260.0),
+    "atk": ( 8.0,   32.0),
+    "def": ( 4.0,   24.0),
+    "spd": ( 7.0,   18.0),
+    "mp":  (20.0,   90.0),
+}
+
+# Aturan baru Rise Rate stat tiap naik level (growth_stats):
+#   1. Batas MINIMUM dan MAKSIMUM rise rate tiap stat SAMA untuk semua star & class.
+#   2. Yang berbeda tiap star HANYA persentase peluang mendapat rise rate bagus.
+#   3. Makin tinggi nilai rise rate, makin kecil persentasenya.
+#   4. Hero 1-star BISA mendapat rise rate maksimum, namun persentasenya sangat kecil.
+STAT_GROWTH_RANGE = {
+    "hp":  (8.0,   26.0),
+    "atk": (0.8,    3.0),
+    "def": (0.5,    1.6),
+    "spd": (0.15,   0.45),
+    "mp":  (1.5,    6.0),
+}
+MP_REGEN_RANGE = (3, 8)
+
+# Pembagian 5 pita (band) proporsional dari rentang [min, max]:
+#   Band 0: 0% - 20%  (Rendah)
+#   Band 1: 20% - 40% (Menengah Bawah)
+#   Band 2: 40% - 60% (Menengah)
+#   Band 3: 60% - 80% (Tinggi)
+#   Band 4: 80% - 100% (Sangat Tinggi / Maksimum)
+STAT_BANDS = [
+    (0.00, 0.20),
+    (0.20, 0.40),
+    (0.40, 0.60),
+    (0.60, 0.80),
+    (0.80, 1.00),
+]
+
+# Bobot persentase (per 1000 = 100.0%) tiap band berdasarkan Star (1..7):
+# - Di SETIAP star, bobot selalu menurun dari Band 0 ke Band 4 (makin tinggi stat,
+#   makin kecil persentasenya).
+# - Makin tinggi star, makin besar bobot di Band 3 & Band 4 (stat / rise rate tinggi).
+# - Hero 1-star tetap punya peluang di Band 4 (0.8%, dan ~0.12% menyentuh puncak
+#   maksimum) sehingga 1-star bisa dapat rise rate maksimum dengan peluang sangat kecil.
+STAR_STAT_BAND_WEIGHTS = {
+    1: (580, 260, 110,  42,   8),   # Band 4 (80-100%): 0.8%
+    2: (480, 275, 150,  75,  20),   # Band 4 (80-100%): 2.0%
+    3: (390, 270, 190, 110,  40),   # Band 4 (80-100%): 4.0%
+    4: (310, 255, 215, 150,  70),   # Band 4 (80-100%): 7.0%
+    5: (250, 230, 210, 185, 125),   # Band 4 (80-100%): 12.5%
+    6: (225, 215, 205, 190, 165),   # Band 4 (80-100%): 16.5%
+    7: (212, 206, 200, 194, 188),   # Band 4 (80-100%): 18.8%
+}
+STAR_GROWTH_BAND_WEIGHTS = dict(STAR_STAT_BAND_WEIGHTS)
+
 # Multiplier stat dasar & growth per star. Catatan canon: hidden potential
 # membuat star awal TIDAK membatasi power akhir (1-star GM 2.5x bisa
 # menyusul 4-star; promosi sampai 7-star untuk semua hero).
 STAR_BASE_MULT = {1: 1.00, 2: 1.25, 3: 1.60, 4: 2.10, 5: 2.80, 6: 3.60, 7: 4.70}
 STAR_GROWTH_MULT = {1: 1.00, 2: 1.20, 3: 1.45, 4: 1.75, 5: 2.15, 6: 2.60, 7: 3.20}
 
-# ----------------------------- PERKS -----------------------------
+# ------------------------ TRAITS (d/h PERKS) ------------------------
 # nama: (tier, deskripsi). Tier mengikuti TIER_WEIGHT di generate_hero.py.
-PERKS = {
-    "Glass Cannon": ("Common",    "ATK +40%, DEF -30%"),
-    "Iron Wall":    ("Common",    "DEF +50%, SPD -15%"),
-    "Quick Step":   ("Common",    "SPD +15%"),
-    "Berserk":      ("Common",    "ATK +35% saat HP < 50%"),
-    "Mana Surge":   ("Rare",      "MP regen +100%"),
-    "Vampiric":     ("Rare",      "Heal diri 20% dari damage fisik"),
-    "Focused Fire": ("Rare",      "+20% damage ke musuh HP terendah"),
-    "Guardian":     ("Rare",      "Saat taunt aktif, DEF ally lain +25%"),
-    "Executioner":  ("Epic",      "Damage x1.5 ke musuh HP < 25%"),
-    "Last Stand":   ("Epic",      "Sekali per battle: bertahan di 1 HP"),
-    "Double Cast":  ("Epic",      "Mage: 15% AoE tanpa konsumsi MP"),
-    "Miracle Hand": ("Epic",      "Heal +30%, 10% crit heal (x2)"),
-    "Late Bloomer": ("Legendary", "Growth +1.5% per level (kumulatif)"),
-    "Unlucky":      ("Legendary", "15% serangannya meleset, ATK +40%"),
-    "Chosen One":   ("Legendary", "GM +0.3, semua stat +10%"),
-    "Phoenix":      ("Legendary", "Sekali per battle: revive 50% HP"),
+# RAHASIA: Tier trait TIDAK ditampilkan di UI pemain!
+TRAITS = {
+    # Common (16)
+    "Glass Cannon":    ("Common",    "ATK +40%, DEF -30%"),
+    "Iron Wall":       ("Common",    "DEF +50%, SPD -15%"),
+    "Quick Step":      ("Common",    "SPD +15%"),
+    "Berserk":         ("Common",    "ATK +35% saat HP < 50%"),
+    "Sturdy Body":     ("Common",    "Max HP +18%"),
+    "Sharp Edge":      ("Common",    "ATK +15%"),
+    "Stone Skin":      ("Common",    "DEF +20%"),
+    "Deep Mind":       ("Common",    "Max MP +25%"),
+    "Nimble Feet":     ("Common",    "SPD +10%, DEF +5%"),
+    "Reckless Charge": ("Common",    "ATK +25%, Max HP -10%"),
+    "Thick Armor":     ("Common",    "DEF +30%, ATK -10%"),
+    "First Strike":    ("Common",    "+25% damage ke musuh HP > 80%"),
+    "Calm Spirit":     ("Common",    "MP regen +2 per ronde"),
+    "Battle Hardened": ("Common",    "Max HP +10%, DEF +10%"),
+    "Fierce Grip":     ("Common",    "ATK +12%, Max HP +8%"),
+    "Light Armor":     ("Common",    "SPD +12%, Max MP +10%"),
+    # Rare (14)
+    "Mana Surge":      ("Rare",      "MP regen +100%"),
+    "Vampiric":        ("Rare",      "Heal diri 20% dari damage fisik"),
+    "Focused Fire":    ("Rare",      "+20% damage ke musuh target"),
+    "Guardian":        ("Rare",      "Saat ada ally taunt aktif, DEF diri +25%"),
+    "Bloodthirst":     ("Rare",      "ATK +20% dan lifesteal +10%"),
+    "Titan Blood":     ("Rare",      "Max HP +28%, DEF +12%"),
+    "Wind Runner":     ("Rare",      "SPD +22%, ATK +10%"),
+    "Arcane Well":     ("Rare",      "Max MP +40%, MP regen +3/ronde"),
+    "Giant Slayer":    ("Rare",      "+25% damage terhadap Boss & Elite"),
+    "Unyielding":      ("Rare",      "DEF +35% saat HP < 50%"),
+    "Precision":       ("Rare",      "ATK +18%, serangan tidak pernah meleset"),
+    "Vitality Aura":   ("Rare",      "Regen 5% Max HP tiap akhir ronde"),
+    "Spell Weaver":    ("Rare",      "Biaya MP semua skill berkurang 15%"),
+    "Counter Stance":  ("Rare",      "DEF +15%, ATK +10% saat terluka"),
+    # Epic (10)
+    "Executioner":     ("Epic",      "Damage x1.5 ke musuh HP < 25%"),
+    "Last Stand":      ("Epic",      "Sekali per battle: bertahan di 1 HP, ATK +30%"),
+    "Double Cast":     ("Epic",      "Skill AoE: 15% tanpa konsumsi MP"),
+    "Miracle Hand":    ("Epic",      "Heal +30%, 10% crit heal (x2)"),
+    "Warlord":         ("Epic",      "ATK +22%, Max HP +20%, DEF +15%"),
+    "Soul Harvester":  ("Epic",      "Max MP +30%, ATK +20%"),
+    "Aegis Heart":     ("Epic",      "DEF +35%, Max HP +15%"),
+    "Overcharge":      ("Epic",      "Saat MP > 70%, damage skill +30%"),
+    "Shadow Step":     ("Epic",      "SPD +28%, ATK +15%"),
+    "Dragon Scales":   ("Epic",      "Max HP +30%, DEF +30%"),
+    # Legendary (8)
+    "Late Bloomer":    ("Legendary", "Growth +1.5% per level (kumulatif)"),
+    "Unlucky":         ("Legendary", "15% serangannya meleset, ATK +40%"),
+    "Chosen One":      ("Legendary", "GM +0.3, semua stat +10%"),
+    "Phoenix":         ("Legendary", "Sekali per battle: revive 50% HP"),
+    "Immortal Vessel": ("Legendary", "Max HP +45%, DEF +25%, regen 8% HP/ronde"),
+    "Godslayer":       ("Legendary", "ATK +35%, +30% damage ke Boss"),
+    "Infinite Mana":   ("Legendary", "Max MP +50%, MP regen +150%, biaya MP -20%"),
+    "Celestial Grace": ("Legendary", "Semua stat +18%, efek heal +25%"),
 }
+# Alias backward-compatibility untuk modul/kode lama
+PERKS = TRAITS
+
+# ----------------------------- SKILLS ----------------------------
+# Sistem Skill:
+#   - 30 skill khusus per class (6 class x 30 = 180 skill class)
+#   - 60 skill Universal (TIDAK boleh ada Taunt di Universal!)
+#   - Total pool = 240 skill unik.
+#   - Tiap hero mendapat 1-2 skill class-nya + 0-3 skill Universal.
+#   - RAHASIA: Tier skill TIDAK ditampilkan di UI pemain!
+# Format per entri: nama: (tier, mp_cost, cd, kind, mult, deskripsi)
+CLASS_SKILLS = {
+    "Tanker": {
+        "Taunt":              ("Common",    10, 3, "taunt",      30.0, "Paksa musuh menarget diri 2 ronde, DEF +30%"),
+        "Shield Bash":        ("Common",    15, 4, "stun",       1.20, "Hantaman perisai 1.2x ATK + peluang stun 20%"),
+        "Iron Taunt":         ("Common",    12, 3, "taunt",      35.0, "Teriakan baja 2 ronde paksa aggro, DEF +35%"),
+        "Guard Stance":       ("Common",    14, 3, "buff_def",   20.0, "Perkuat pertahanan party DEF +20% (3 ronde)"),
+        "Heavy Buckler":      ("Common",    14, 2, "single",     1.35, "Pukulan perisai berat 1.35x ATK"),
+        "Stone Provoke":      ("Common",    11, 3, "taunt",      30.0, "Provokasi batu 2 ronde, DEF +30%"),
+        "Fortress Slam":      ("Common",    16, 3, "single",     1.45, "Hantaman benteng 1.45x ATK"),
+        "Anvil Strike":       ("Common",    15, 3, "stun",       1.25, "Pukulan paron 1.25x ATK + stun 20%"),
+        "Vanguard Shout":     ("Common",    13, 3, "taunt",      32.0, "Teriakan garda depan 2 ronde, DEF +32%"),
+        "Bulwark Smash":      ("Common",    16, 3, "single",     1.50, "Tebasan perisai raksasa 1.5x ATK"),
+        "Aegis Provoke":      ("Rare",      14, 3, "taunt",      40.0, "Provokasi Aegis 2 ronde, DEF +40%"),
+        "Shield Wall":        ("Rare",      20, 3, "buff_def",   28.0, "Dinding perisai party DEF +28% (3 ronde)"),
+        "Tremor Stomp":       ("Rare",      22, 3, "aoe_slow",   0.65, "Injakan gempa AoE 0.65x ATK + slow musuh"),
+        "Armor Crush":        ("Rare",      18, 3, "pierce",     1.40, "Remukkan zirah 1.4x ATK (ignore DEF)"),
+        "Sentinel Bash":      ("Rare",      18, 3, "stun",       1.40, "Hantaman sentinel 1.4x ATK + stun 25%"),
+        "Bastion Roar":       ("Rare",      15, 3, "taunt",      42.0, "Raungan bastion 2 ronde paksa aggro, DEF +42%"),
+        "Tower Charge":       ("Rare",      19, 3, "single",     1.65, "Serudukan perisai menara 1.65x ATK"),
+        "Spiked Shield":      ("Rare",      17, 2, "drain",      1.35, "Serangan perisai berduri 1.35x ATK + serap HP"),
+        "Phalanx Guard":      ("Rare",      22, 4, "buff_def",   30.0, "Formasi Phalanx DEF party +30% (3 ronde)"),
+        "Golem Fist":         ("Rare",      20, 3, "stun",       1.45, "Tinju golem 1.45x ATK + peluang stun 25%"),
+        "Colossus Taunt":     ("Epic",      16, 3, "taunt",      50.0, "Provokasi kolosus 2 ronde, DEF +50%"),
+        "Earthshaker":        ("Epic",      28, 4, "aoe_stun",   0.85, "Belah bumi AoE 0.85x ATK + stun 15%"),
+        "Obsidian Fortress":  ("Epic",      25, 4, "buff_def",   35.0, "Benteng obsidian DEF party +35% (3 ronde)"),
+        "Juggernaut Impact":  ("Epic",      24, 3, "stun",       1.75, "Tabrakan Juggernaut 1.75x ATK + stun 35%"),
+        "Guardian Vow":       ("Epic",      22, 4, "cleanse_heal",1.30, "Sumpah pelindung: pulihkan HP & hapus stun ally"),
+        "Steel Avalanche":    ("Epic",      26, 4, "aoe_slow",   0.80, "Longsoran baja AoE 0.8x ATK + slow 2 ronde"),
+        "Titan Provoke":      ("Legendary", 18, 3, "taunt",      65.0, "Provokasi Titan 2 ronde, DEF +65%"),
+        "Immortal Bastion":   ("Legendary", 32, 5, "buff_all",   30.0, "Berkah benteng abadi: ATK & SPD party +30%"),
+        "Worldbreaker Slam":  ("Legendary", 38, 5, "aoe_stun",   1.35, "Hantaman penghancur AoE 1.35x ATK + stun 25%"),
+        "Aegis of Dawn":      ("Legendary", 30, 4, "mass_heal",  1.10, "Cahaya Aegis: pulihkan HP seluruh party"),
+    },
+    "Dealer": {
+        "Power Strike":       ("Common",    20, 3, "single",     1.80, "Serangan kuat 1.8x ATK ke 1 musuh"),
+        "Savage Slash":       ("Common",    14, 2, "single",     1.55, "Tebasan buas 1.55x ATK ke 1 musuh"),
+        "Double Edge":        ("Common",    16, 2, "single",     1.65, "Tebasan ganda 1.65x ATK"),
+        "Blade Thrust":       ("Common",    15, 2, "pierce",     1.35, "Tusukan pedang 1.35x ATK menembus DEF"),
+        "Brutal Cleave":      ("Common",    18, 3, "single",     1.70, "Ayunan brutal 1.7x ATK"),
+        "Rending Cut":        ("Common",    15, 2, "single",     1.60, "Sayatan perobek 1.6x ATK"),
+        "Crimson Bite":       ("Common",    18, 3, "drain",      1.35, "Tebasan merah 1.35x ATK + serap HP"),
+        "Pommel Strike":      ("Common",    16, 3, "stun",       1.30, "Hantaman gagang pedang 1.3x ATK + stun 20%"),
+        "Furious Lunge":      ("Common",    17, 2, "single",     1.68, "Terjangan murka 1.68x ATK"),
+        "Razor Whirl":        ("Common",    22, 3, "aoe_slow",   0.60, "Putaran pisau AoE 0.6x ATK + slow"),
+        "Shadow Fang":        ("Rare",      20, 2, "pierce",     1.55, "Taring bayangan 1.55x ATK ignore DEF"),
+        "Blood Frenzy":       ("Rare",      22, 3, "drain",      1.55, "Amukan darah 1.55x ATK + serap 40% HP"),
+        "Guillotine Blade":   ("Rare",      24, 3, "single",     1.95, "Tebasan guillotine 1.95x ATK"),
+        "Whirlwind Slash":    ("Rare",      28, 3, "aoe_stun",   0.75, "Tebasan angin puyuh AoE 0.75x ATK + stun 10%"),
+        "Armor Breaker":      ("Rare",      20, 2, "pierce",     1.60, "Penghancur zirah 1.6x ATK ignore DEF"),
+        "Viper Strike":       ("Rare",      19, 2, "single",     1.85, "Sabetan berbisa 1.85x ATK"),
+        "Skull Splitter":     ("Rare",      23, 3, "stun",       1.60, "Pembelah tengkorak 1.6x ATK + stun 25%"),
+        "Phantom Cut":        ("Rare",      21, 2, "pierce",     1.58, "Tebasan hantu 1.58x ATK menembus DEF"),
+        "Reaper Scythe":      ("Rare",      25, 3, "drain",      1.60, "Sabit pencabut nyawa 1.6x ATK + serap HP"),
+        "Berserker Rush":     ("Rare",      24, 3, "single",     2.00, "Serbuan berserker 2.0x ATK"),
+        "Assassinate":        ("Epic",      28, 3, "pierce",     1.90, "Eksekusi senyap 1.9x ATK ignore DEF"),
+        "Blade Storm":        ("Epic",      36, 4, "aoe_pierce", 0.95, "Badai pedang AoE 0.95x ATK ignore DEF"),
+        "Execution Slash":    ("Epic",      30, 3, "single",     2.25, "Tebasan algojo 2.25x ATK"),
+        "Soul Rend":          ("Epic",      28, 3, "drain",      1.80, "Robekan jiwa 1.8x ATK + lifesteal 40%"),
+        "Thunder Cleave":     ("Epic",      30, 3, "stun",       1.95, "Tebasan petir 1.95x ATK + stun 35%"),
+        "Demonic Flurry":     ("Epic",      32, 4, "single",     2.35, "Rentetan iblis 2.35x ATK ke target"),
+        "Abyssal Sever":      ("Legendary", 42, 4, "pierce",     2.40, "Tebasan jurang 2.4x ATK menembus DEF"),
+        "Ragnarok Edge":      ("Legendary", 50, 5, "aoe_stun",   1.65, "Pedang Ragnarok AoE 1.65x ATK + stun 25%"),
+        "Blood Moon Slash":   ("Legendary", 40, 4, "drain",      2.20, "Tebasan bulan darah 2.2x ATK + lifesteal"),
+        "Godslayer Thrust":   ("Legendary", 45, 5, "pierce",     2.60, "Tusukan pembunuh dewa 2.6x ATK ignore DEF"),
+    },
+    "Archer": {
+        "Piercing Shot":      ("Common",    18, 2, "pierce",     1.50, "Tembakan 1.5x ATK menembus DEF musuh"),
+        "Quick Arrow":        ("Common",    12, 2, "single",     1.48, "Panah kilat 1.48x ATK"),
+        "Aimed Shot":         ("Common",    16, 2, "single",     1.65, "Tembakan terbidik 1.65x ATK"),
+        "Pinning Arrow":      ("Common",    16, 3, "stun",       1.25, "Panah pengunci 1.25x ATK + stun 20%"),
+        "Barbed Bolt":        ("Common",    15, 2, "single",     1.58, "Anak panah berduri 1.58x ATK"),
+        "Split Arrow":        ("Common",    22, 3, "aoe_slow",   0.55, "Panah bercabang AoE 0.55x ATK + slow"),
+        "Hawk Shot":          ("Common",    17, 2, "pierce",     1.42, "Panah elang 1.42x ATK ignore DEF"),
+        "Frost Arrow":        ("Common",    18, 3, "aoe_slow",   0.58, "Panah es AoE 0.58x ATK + slow musuh"),
+        "Longbow Snipe":      ("Common",    19, 3, "single",     1.75, "Tembakan busur panjang 1.75x ATK"),
+        "Wind Arrow":         ("Common",    14, 2, "single",     1.52, "Panah angin 1.52x ATK"),
+        "Armor Piercer":      ("Rare",      20, 2, "pierce",     1.62, "Panah penembus baja 1.62x ATK ignore DEF"),
+        "Arrow Rain":         ("Rare",      28, 3, "aoe_slow",   0.75, "Hujan panah AoE 0.75x ATK + slow 2 ronde"),
+        "Heartseeker":        ("Rare",      24, 3, "single",     2.00, "Panah pencari jantung 2.0x ATK"),
+        "Concussive Shot":    ("Rare",      22, 3, "stun",       1.55, "Tembakan gegar 1.55x ATK + stun 25%"),
+        "Venom Volley":       ("Rare",      26, 3, "aoe_stun",   0.70, "Volley racun AoE 0.7x ATK + stun 10%"),
+        "Gale Snipe":         ("Rare",      21, 2, "pierce",     1.65, "Snipe badai 1.65x ATK menembus DEF"),
+        "Leech Arrow":        ("Rare",      22, 3, "drain",      1.50, "Panah penghisap 1.5x ATK + lifesteal"),
+        "Rapid Volley":       ("Rare",      23, 3, "single",     1.92, "Tembakan beruntun 1.92x ATK"),
+        "Silver Bolt":        ("Rare",      20, 2, "pierce",     1.60, "Pasak perak 1.6x ATK ignore DEF"),
+        "Falcon Eye":         ("Rare",      20, 3, "buff_atk",   25.0, "Fokus mata elang: ATK party +25% (3 ronde)"),
+        "Deadeye Snipe":      ("Epic",      30, 3, "pierce",     2.00, "Tembakan maut 2.0x ATK ignore DEF"),
+        "Storm of Arrows":    ("Epic",      38, 4, "aoe_pierce", 1.00, "Badai panah AoE 1.0x ATK menembus DEF"),
+        "Thunder Arrow":      ("Epic",      28, 3, "stun",       1.90, "Panah halilintar 1.9x ATK + stun 35%"),
+        "Phantom Volley":     ("Epic",      34, 4, "aoe_stun",   0.95, "Volley bayangan AoE 0.95x ATK + stun 15%"),
+        "Dragon Piercer":     ("Epic",      32, 3, "pierce",     2.10, "Penembus sisik naga 2.1x ATK ignore DEF"),
+        "Moonlight Shot":     ("Epic",      28, 3, "drain",      1.80, "Panah cahaya bulan 1.8x ATK + lifesteal"),
+        "Starfall Arrow":     ("Legendary", 48, 5, "aoe_pierce", 1.40, "Hujan panah bintang AoE 1.4x ATK ignore DEF"),
+        "Astraea Bolt":       ("Legendary", 42, 4, "pierce",     2.50, "Panah dewi Astraea 2.5x ATK ignore DEF"),
+        "Heavenly Barrage":   ("Legendary", 52, 5, "aoe_stun",   1.65, "Rentetan surga AoE 1.65x ATK + stun 25%"),
+        "Void Snipe":         ("Legendary", 44, 4, "pierce",     2.55, "Tembakan kehampaan 2.55x ATK ignore DEF"),
+    },
+    "Healer": {
+        "Heal":               ("Common",    25, 2, "heal",       2.00, "Pulihkan HP 1 ally kritis (2x ATK + 25)"),
+        "Mending Light":      ("Common",    20, 2, "heal",       1.75, "Cahaya pemulih 1 ally (1.75x ATK + 25)"),
+        "Gentle Prayer":      ("Common",    22, 2, "heal",       1.85, "Doa lembut pemulih HP 1 ally"),
+        "Holy Bolt":          ("Common",    15, 2, "single",     1.45, "Bola cahaya suci 1.45x ATK ke musuh"),
+        "Soothing Breeze":    ("Common",    24, 2, "heal",       1.95, "Angin penyejuk pemulih 1 ally"),
+        "Purifying Touch":    ("Common",    22, 3, "cleanse_heal",1.60, "Pulihkan HP 1 ally & hapus efek stun"),
+        "Minor Grace":        ("Common",    18, 2, "heal",       1.65, "Berkah pemulihan cepat 1 ally"),
+        "Radiant Spark":      ("Common",    16, 2, "single",     1.50, "Percikan suci 1.5x ATK ke musuh"),
+        "Blessing of Vita":   ("Common",    26, 2, "heal",       2.10, "Berkah kehidupan 1 ally (2.1x ATK + 25)"),
+        "Sacred Mend":        ("Common",    23, 2, "heal",       1.90, "Jahitan suci pemulih luka ally"),
+        "Greater Heal":       ("Rare",      30, 2, "heal",       2.45, "Pemulihan besar 1 ally (2.45x ATK + 25)"),
+        "Circle of Healing":  ("Rare",      38, 4, "mass_heal",  1.05, "Lingkaran pemulih seluruh party"),
+        "Cleanse Spirit":     ("Rare",      26, 3, "cleanse_heal",2.00, "Murnikan jiwa & pulihkan HP ally"),
+        "Holy Barrier":       ("Rare",      22, 3, "buff_def",   28.0, "Perisai suci DEF party +28% (3 ronde)"),
+        "Life Drain":         ("Rare",      22, 3, "drain",      1.50, "Serap energi musuh 1.5x ATK jadi HP"),
+        "Sunbeam":            ("Rare",      24, 3, "stun",       1.50, "Sinar surya 1.5x ATK + peluang stun 25%"),
+        "Prayer of Mending":  ("Rare",      32, 3, "heal",       2.55, "Doa kesembuhan 2.55x ATK ke 1 ally"),
+        "Divine Dew":         ("Rare",      36, 4, "mass_heal",  1.00, "Embun ilahi pemulih seluruh party"),
+        "Sanctuary Light":    ("Rare",      28, 3, "heal",       2.35, "Cahaya suaka pemulih ally kritis"),
+        "Guiding Halo":       ("Rare",      22, 3, "buff_atk",   25.0, "Halo penuntun: ATK party +25% (3 ronde)"),
+        "Mass Heal":          ("Epic",      45, 5, "mass_heal",  1.20, "Pulihkan HP seluruh party (1.2x ATK + 15)"),
+        "Seraphim Embrace":   ("Epic",      36, 3, "heal",       3.00, "Pelukan Seraphim: heal besar 3.0x ATK ke 1 ally"),
+        "Purge Evil":         ("Epic",      34, 4, "aoe_pierce", 0.90, "Cahaya pemurni AoE 0.9x ATK ignore DEF"),
+        "Fountain of Life":   ("Epic",      42, 4, "mass_heal",  1.15, "Pancuran kehidupan untuk seluruh party"),
+        "Sacred Renewal":     ("Epic",      34, 3, "cleanse_heal",2.60, "Pembaruan suci: heal kuat & hapus stun"),
+        "Archangel Ward":     ("Epic",      30, 4, "buff_all",   24.0, "Perlindungan malaikat: ATK & SPD party +24%"),
+        "Miracle Salvation":  ("Legendary", 52, 5, "mass_heal",  1.65, "Mujizat keselamatan: heal besar seluruh party"),
+        "Tear of Goddess":    ("Legendary", 44, 3, "heal",       3.80, "Air mata dewi: pulihkan 3.8x ATK ke 1 ally"),
+        "Heaven's Light":     ("Legendary", 50, 5, "aoe_stun",   1.55, "Cahaya surga AoE 1.55x ATK + stun 25%"),
+        "Genesis Blessing":   ("Legendary", 48, 5, "mass_heal",  1.50, "Berkah penciptaan: pulihkan seluruh party"),
+    },
+    "Buffer": {
+        "Attack Hymn":        ("Common",    20, 3, "buff_atk",   30.0, "Buff ATK seluruh party +30% (3 ronde)"),
+        "Guard Hymn":         ("Common",    20, 3, "buff_def",   25.0, "Buff DEF seluruh party +25% (3 ronde)"),
+        "March of Valor":     ("Common",    18, 3, "buff_atk",   25.0, "Mars keberanian: ATK party +25% (3 ronde)"),
+        "Iron Chant":         ("Common",    18, 3, "buff_def",   22.0, "Nyanyian besi: DEF party +22% (3 ronde)"),
+        "Swift Melody":       ("Common",    18, 3, "buff_spd",   20.0, "Melodi angin: SPD party +20% (3 ronde)"),
+        "Sonic Note":         ("Common",    15, 2, "single",     1.45, "Nada sonik 1.45x ATK ke musuh"),
+        "Courageous Beat":    ("Common",    19, 3, "buff_atk",   28.0, "Ketukan berani: ATK party +28% (3 ronde)"),
+        "Shielding Tune":     ("Common",    19, 3, "buff_def",   24.0, "Nada pelindung: DEF party +24% (3 ronde)"),
+        "Breeze Cadence":     ("Common",    17, 3, "buff_spd",   18.0, "Irama semilir: SPD party +18% (3 ronde)"),
+        "Resonant Strike":    ("Common",    16, 2, "single",     1.50, "Serangan resonansi 1.5x ATK"),
+        "Battle Ballad":      ("Rare",      22, 3, "buff_atk",   34.0, "Balada tempur: ATK party +34% (3 ronde)"),
+        "Fortress Anthem":    ("Rare",      22, 3, "buff_def",   30.0, "Anthem benteng: DEF party +30% (3 ronde)"),
+        "Gale Concerto":      ("Rare",      22, 3, "buff_spd",   25.0, "Konserto badai: SPD party +25% (3 ronde)"),
+        "Mana Chorus":        ("Rare",      24, 4, "mana_gift",  20.0, "Koor mana: pulihkan +20 MP ke ally lain"),
+        "Echoing Shock":      ("Rare",      24, 3, "aoe_slow",   0.70, "Gelombang gema AoE 0.7x ATK + slow"),
+        "Inspiring Aria":     ("Rare",      24, 4, "buff_all",   20.0, "Aria inspirasi: ATK & SPD party +20%"),
+        "Dissonant Chord":    ("Rare",      21, 3, "stun",       1.45, "Akord disonan 1.45x ATK + stun 25%"),
+        "Hymn of Vigor":      ("Rare",      26, 3, "heal",       2.00, "Himne vitalitas: pulihkan HP 1 ally"),
+        "Tactical Command":   ("Rare",      23, 3, "buff_atk",   35.0, "Komando taktis: ATK party +35% (3 ronde)"),
+        "Aegis Serenade":     ("Rare",      23, 3, "buff_def",   32.0, "Serenade Aegis: DEF party +32% (3 ronde)"),
+        "War Cry":            ("Epic",      25, 4, "buff_all",   25.0, "Buff ATK +25% & SPD +20% party (3 ronde)"),
+        "Symphony of Wrath":  ("Epic",      28, 4, "buff_atk",   42.0, "Simfoni murka: ATK party +42% (3 ronde)"),
+        "Bastion Oratorio":   ("Epic",      28, 4, "buff_def",   38.0, "Oratorio bastion: DEF party +38% (3 ronde)"),
+        "Requiem Blast":      ("Epic",      34, 4, "aoe_stun",   0.90, "Ledakan Requiem AoE 0.9x ATK + stun 15%"),
+        "Arcane Rhapsody":    ("Epic",      30, 4, "mana_gift",  30.0, "Rapsodi arkana: +30 MP ke semua ally"),
+        "Heroic Overture":    ("Epic",      30, 4, "buff_all",   28.0, "Overture heroik: ATK & SPD party +28%"),
+        "Sovereign Decree":   ("Legendary", 36, 5, "buff_all",   38.0, "Titah penguasa: ATK & SPD party +38% (3 ronde)"),
+        "Celestial Choir":    ("Legendary", 42, 5, "mass_heal",  1.30, "Paduan suara langit: heal seluruh party"),
+        "Anthem of Legends":  ("Legendary", 38, 5, "buff_atk",   50.0, "Anthem legenda: ATK party +50% (3 ronde)"),
+        "Apocalypse Crescendo":("Legendary",46, 5, "aoe_pierce", 1.30, "Kresendo akhir zaman AoE 1.3x ATK ignore DEF"),
+    },
+    "Mage": {
+        "Fireball":           ("Common",    30, 2, "aoe_stun",   0.75, "AoE 0.75x ATK ke semua musuh + stun 10%"),
+        "Arcane Bolt":        ("Common",    16, 2, "single",     1.65, "Peluru arkana 1.65x ATK ke 1 musuh"),
+        "Ice Shard":          ("Common",    22, 2, "aoe_slow",   0.55, "Pecahan es AoE 0.55x ATK + slow"),
+        "Spark Wave":         ("Common",    24, 2, "aoe_stun",   0.62, "Gelombang listrik AoE 0.62x ATK + stun 10%"),
+        "Flame Lance":        ("Common",    18, 2, "pierce",     1.48, "Tombak api 1.48x ATK menembus DEF"),
+        "Wind Cutter":        ("Common",    22, 2, "aoe_slow",   0.58, "Pemotong angin AoE 0.58x ATK + slow"),
+        "Dark Orb":           ("Common",    20, 2, "drain",      1.40, "Bola kegelapan 1.4x ATK + serap HP"),
+        "Magma Splash":       ("Common",    26, 3, "aoe_stun",   0.68, "Percikan magma AoE 0.68x ATK + stun 10%"),
+        "Mind Spike":         ("Common",    19, 2, "pierce",     1.50, "Pasak pikiran 1.5x ATK ignore DEF"),
+        "Frost Bolt":         ("Common",    17, 2, "stun",       1.35, "Panah beku 1.35x ATK + peluang stun 20%"),
+        "Chain Lightning":    ("Rare",      32, 3, "aoe_stun",   0.85, "Petir berantai AoE 0.85x ATK + stun 15%"),
+        "Blizzard":           ("Rare",      34, 3, "aoe_slow",   0.80, "Badai salju AoE 0.8x ATK + slow 2 ronde"),
+        "Void Ray":           ("Rare",      26, 3, "pierce",     1.75, "Sinar kehampaan 1.75x ATK ignore DEF"),
+        "Inferno Pillar":     ("Rare",      34, 3, "aoe_stun",   0.88, "Pilar neraka AoE 0.88x ATK + stun 12%"),
+        "Soul Siphon":        ("Rare",      26, 3, "drain",      1.65, "Penyedot jiwa 1.65x ATK + lifesteal 40%"),
+        "Gravity Crush":      ("Rare",      32, 3, "aoe_slow",   0.82, "Tekanan gravitasi AoE 0.82x ATK + slow"),
+        "Thunder Cage":       ("Rare",      25, 3, "stun",       1.68, "Penjara petir 1.68x ATK + stun 30%"),
+        "Acid Tempest":       ("Rare",      35, 3, "aoe_pierce", 0.78, "Badai asam AoE 0.78x ATK ignore DEF"),
+        "Plasma Burst":       ("Rare",      28, 3, "single",     2.05, "Ledakan plasma 2.05x ATK ke 1 musuh"),
+        "Nether Flare":       ("Rare",      33, 3, "aoe_stun",   0.84, "Suar bawah tanah AoE 0.84x ATK + stun 12%"),
+        "Frost Nova":         ("Epic",      40, 4, "aoe_slow",   0.95, "AoE es 0.95x ATK + slow -30% SPD (2 ronde)"),
+        "Hellfire Storm":     ("Epic",      44, 4, "aoe_stun",   1.15, "Badai api neraka AoE 1.15x ATK + stun 18%"),
+        "Arcane Barrage":     ("Epic",      42, 4, "aoe_pierce", 1.05, "Rentetan arkana AoE 1.05x ATK ignore DEF"),
+        "Abyssal Vortex":     ("Epic",      40, 4, "aoe_slow",   1.00, "Pusaran jurang AoE 1.0x ATK + slow"),
+        "Disintegrate":       ("Epic",      36, 3, "pierce",     2.25, "Sinar disintegrasi 2.25x ATK ignore DEF"),
+        "Thunderstorm":       ("Epic",      45, 4, "aoe_stun",   1.18, "Badai petir AoE 1.18x ATK + stun 20%"),
+        "Meteor":             ("Legendary", 60, 6, "aoe_stun",   2.00, "AoE 2.0x ATK + stun 25% ke semua musuh"),
+        "Supernova":          ("Legendary", 58, 6, "aoe_pierce", 1.60, "Ledakan bintang AoE 1.6x ATK ignore DEF"),
+        "Absolute Zero":      ("Legendary", 54, 5, "aoe_slow",   1.55, "Beku mutlak AoE 1.55x ATK + slow semua musuh"),
+        "Cataclysm":          ("Legendary", 62, 6, "aoe_stun",   2.10, "Bencana kehancuran AoE 2.1x ATK + stun 25%"),
+    },
+}
+
+# 60 Universal Skills (TIDAK ADA Taunt di sini — Taunt hanya milik Tanker!)
+UNIVERSAL_SKILLS = {
+    # Common (24)
+    "Quick Slash":        ("Common",    12, 2, "single",     1.45, "Tebasan cepat 1.45x ATK ke musuh terlemah"),
+    "Heavy Blow":         ("Common",    15, 2, "single",     1.55, "Pukulan berat 1.55x ATK"),
+    "Lunging Thrust":     ("Common",    14, 2, "pierce",     1.30, "Tusukan menerjang 1.3x ATK ignore DEF"),
+    "First Aid":          ("Common",    20, 2, "heal",       1.60, "Pertolongan pertama pemulih HP ally"),
+    "Focus Breath":       ("Common",    16, 3, "buff_atk",   18.0, "Napas fokus: ATK party +18% (3 ronde)"),
+    "Iron Skin Art":      ("Common",    16, 3, "buff_def",   18.0, "Teknik kulit besi: DEF party +18% (3 ronde)"),
+    "Sprint Step":        ("Common",    15, 3, "buff_spd",   15.0, "Langkah cepat: SPD party +15% (3 ronde)"),
+    "Low Kick":           ("Common",    14, 3, "stun",       1.20, "Tendangan bawah 1.2x ATK + stun 20%"),
+    "Stone Throw":        ("Common",    12, 2, "single",     1.40, "Lemparan batu keras 1.4x ATK"),
+    "Spinning Kick":      ("Common",    16, 2, "single",     1.58, "Tendangan berputar 1.58x ATK"),
+    "Shoulder Tackle":    ("Common",    15, 3, "stun",       1.25, "Tabrakan bahu 1.25x ATK + stun 20%"),
+    "Vigor Breathe":      ("Common",    18, 2, "heal",       1.55, "Pernapasan vitalitas pemulih HP"),
+    "Keen Strike":        ("Common",    14, 2, "pierce",     1.32, "Serangan tajam 1.32x ATK ignore DEF"),
+    "Leech Bite":         ("Common",    16, 2, "drain",      1.28, "Gigitan penghisap 1.28x ATK + lifesteal"),
+    "Dust Sweep":         ("Common",    18, 3, "aoe_slow",   0.50, "Sapuan debu AoE 0.5x ATK + slow"),
+    "Palm Strike":        ("Common",    13, 2, "single",     1.48, "Hantaman telapak 1.48x ATK"),
+    "Knee Smash":         ("Common",    15, 2, "single",     1.52, "Hantaman lutut 1.52x ATK"),
+    "Sand Toss":          ("Common",    14, 3, "stun",       1.18, "Lemparan pasir 1.18x ATK + stun 20%"),
+    "Combat Roll":        ("Common",    16, 3, "buff_spd",   16.0, "Guling taktis: SPD party +16% (3 ronde)"),
+    "Guard Up":           ("Common",    16, 3, "buff_def",   16.0, "Siaga bertahan: DEF party +16% (3 ronde)"),
+    "Rally Call":         ("Common",    17, 3, "buff_atk",   20.0, "Seruan semangat: ATK party +20% (3 ronde)"),
+    "Spark Slash":        ("Common",    15, 2, "single",     1.54, "Tebasan percikan 1.54x ATK"),
+    "Frost Touch":        ("Common",    16, 2, "single",     1.50, "Sentuhan beku 1.5x ATK"),
+    "Siphon Touch":       ("Common",    17, 2, "drain",      1.32, "Sentuhan serap 1.32x ATK + lifesteal"),
+    # Rare (18)
+    "Blood Drain":        ("Rare",      22, 3, "drain",      1.50, "Serang 1.5x ATK & serap 40% dmg jadi HP"),
+    "Sonic Slash":        ("Rare",      20, 2, "pierce",     1.52, "Tebasan gelombang suara 1.52x ATK ignore DEF"),
+    "Flame Slash":        ("Rare",      22, 2, "single",     1.82, "Tebasan api membara 1.82x ATK"),
+    "Frost Slash":        ("Rare",      24, 3, "aoe_slow",   0.68, "Tebasan es AoE 0.68x ATK + slow"),
+    "Shockwave":          ("Rare",      26, 3, "aoe_stun",   0.70, "Gelombang kejut AoE 0.7x ATK + stun 10%"),
+    "Second Wind":        ("Rare",      26, 3, "heal",       2.15, "Napas kedua pemulih HP kritis"),
+    "Battle Focus":       ("Rare",      22, 3, "buff_atk",   28.0, "Fokus tempur: ATK party +28% (3 ronde)"),
+    "Steel Mentality":    ("Rare",      22, 3, "buff_def",   26.0, "Mental baja: DEF party +26% (3 ronde)"),
+    "Haste Aura":         ("Rare",      22, 3, "buff_spd",   22.0, "Aura percepatan: SPD party +22% (3 ronde)"),
+    "Crushing Blow":      ("Rare",      21, 3, "stun",       1.52, "Pukulan peremuk 1.52x ATK + stun 25%"),
+    "Vital Pierce":       ("Rare",      21, 2, "pierce",     1.56, "Tusukan titik vital 1.56x ATK ignore DEF"),
+    "Spirit Transfer":    ("Rare",      24, 4, "mana_gift",  18.0, "Transfer energi: +18 MP ke ally"),
+    "Purify Herb":        ("Rare",      24, 3, "cleanse_heal",1.85, "Ramuan pemurni: heal & hapus stun ally"),
+    "Gale Sweep":         ("Rare",      25, 3, "aoe_slow",   0.72, "Sapuan angin ribut AoE 0.72x ATK + slow"),
+    "Vampiric Strike":    ("Rare",      23, 3, "drain",      1.55, "Serangan vampir 1.55x ATK + lifesteal"),
+    "Lightning Jab":      ("Rare",      22, 3, "stun",       1.55, "Tusukan kilat 1.55x ATK + stun 25%"),
+    "Armor Shatter":      ("Rare",      22, 2, "pierce",     1.58, "Pecahkan pelindung 1.58x ATK ignore DEF"),
+    "Crimson Wave":       ("Rare",      27, 3, "aoe_stun",   0.72, "Gelombang merah AoE 0.72x ATK + stun 10%"),
+    # Epic (12)
+    "Thunder Bolt":       ("Epic",      28, 3, "stun",       1.90, "Petir 1.9x ATK ke 1 musuh + stun 35%"),
+    "Soul Strike":        ("Epic",      30, 3, "pierce",     1.95, "Hantaman jiwa 1.95x ATK menembus DEF"),
+    "Life Siphon":        ("Epic",      28, 3, "drain",      1.80, "Kuras nyawa 1.8x ATK + lifesteal 40%"),
+    "Earth Cleave":       ("Epic",      34, 4, "aoe_stun",   0.92, "Belahan bumi AoE 0.92x ATK + stun 15%"),
+    "Tempest Fury":       ("Epic",      34, 4, "aoe_slow",   0.90, "Amukan badai AoE 0.9x ATK + slow"),
+    "Overdrive":          ("Epic",      28, 4, "buff_all",   24.0, "Overdrive: ATK & SPD party +24% (3 ronde)"),
+    "Renewal Pulse":      ("Epic",      38, 4, "mass_heal",  1.10, "Denyut pembaruan: pulihkan seluruh party"),
+    "Phantom Thrust":     ("Epic",      29, 3, "pierce",     1.92, "Tusukan bayangan 1.92x ATK ignore DEF"),
+    "Gravity Wave":       ("Epic",      35, 4, "aoe_slow",   0.92, "Gelombang gravitasi AoE 0.92x ATK + slow"),
+    "Dragon Fang":        ("Epic",      30, 3, "single",     2.20, "Taring naga 2.2x ATK ke 1 musuh"),
+    "Mana Fountain":      ("Epic",      30, 4, "mana_gift",  28.0, "Pancuran mana: +28 MP ke seluruh party"),
+    "Void Slash":         ("Epic",      36, 4, "aoe_pierce", 0.92, "Tebasan hampa AoE 0.92x ATK ignore DEF"),
+    # Legendary (6)
+    "Divine Judgment":    ("Legendary", 50, 5, "aoe_pierce", 1.35, "AoE 1.35x ATK menembus DEF semua musuh"),
+    "Astral Nova":        ("Legendary", 52, 5, "aoe_stun",   1.65, "Nova astral AoE 1.65x ATK + stun 25%"),
+    "Immortal Aura":      ("Legendary", 40, 5, "buff_all",   35.0, "Aura abadi: ATK & SPD party +35% (3 ronde)"),
+    "Eternity Heal":      ("Legendary", 46, 5, "mass_heal",  1.40, "Cahaya keabadian: pulihkan seluruh party"),
+    "Oblivion Strike":    ("Legendary", 42, 4, "pierce",     2.45, "Hantaman kehampaan 2.45x ATK ignore DEF"),
+    "Soul Harvest":       ("Legendary", 40, 4, "drain",      2.15, "Panen jiwa 2.15x ATK + lifesteal 40%"),
+}
+
+# Gabungan seluruh 240 skill: nama -> (cls, tier, mp_cost, cd, kind, mult, description)
+SKILLS = {}
+for _cls_name, _sdict in CLASS_SKILLS.items():
+    for _sname, (_t, _mp, _cd, _k, _m, _d) in _sdict.items():
+        SKILLS[_sname] = (_cls_name, _t, _mp, _cd, _k, _m, _d)
+for _sname, (_t, _mp, _cd, _k, _m, _d) in UNIVERSAL_SKILLS.items():
+    SKILLS[_sname] = ("Universal", _t, _mp, _cd, _k, _m, _d)
 
 # --------------------------- EQUIPMENT ---------------------------
 TIER_LABEL = {1: "Common", 2: "Uncommon", 3: "Rare", 4: "Epic", 5: "Legendary"}
@@ -213,8 +614,8 @@ def init_db(path=None, force=False, wipe_accounts=False):
             cur.execute("DELETE FROM accounts")
         if force:
             # Hapus isi tabel DATA GAME saja; accounts dibiarkan utuh.
-            for t in ("hero_names", "perks", "items_master", "class_stats",
-                      "star_mults"):
+            for t in ("hero_names", "perks", "skills", "items_master",
+                      "class_stats", "star_mults"):
                 cur.execute("DELETE FROM %s" % t)
         _seed_all(conn)
         conn.commit()
@@ -243,6 +644,22 @@ def _create_tables(conn):
             tier        TEXT NOT NULL,
             description TEXT NOT NULL
         )""")
+    # 2b) skills: pool 240 skill (30 per class x 6 + 60 Universal)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS skills (
+            name        TEXT PRIMARY KEY,
+            cls         TEXT NOT NULL DEFAULT 'Universal',
+            tier        TEXT NOT NULL,
+            mp_cost     INTEGER NOT NULL,
+            cd          INTEGER NOT NULL,
+            kind        TEXT NOT NULL,
+            mult        REAL NOT NULL,
+            description TEXT NOT NULL
+        )""")
+    try:
+        cur.execute("ALTER TABLE skills ADD COLUMN cls TEXT NOT NULL DEFAULT 'Universal'")
+    except sqlite3.Error:
+        pass
     # 3) items_master: semua item (equipment/potion/material/ticket)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS items_master (
@@ -306,10 +723,15 @@ def _seed_all(conn):
     cur.executemany(
         "INSERT OR IGNORE INTO hero_names (first_name, last_name, title) VALUES (?,?,?)",
         rows)
-    # perks
+    # traits (tabel perks dipertahankan namanya untuk kompatibilitas DB lama)
     cur.executemany(
         "INSERT OR IGNORE INTO perks (name, tier, description) VALUES (?,?,?)",
-        [(n, t, d) for n, (t, d) in PERKS.items()])
+        [(n, t, d) for n, (t, d) in TRAITS.items()])
+    # skills (30 per class x 6 + 60 Universal = 240 skill)
+    cur.executemany(
+        "INSERT OR IGNORE INTO skills (name, cls, tier, mp_cost, cd, kind, mult, description) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        [(n, c, t, mp, cd, k, m, d) for n, (c, t, mp, cd, k, m, d) in SKILLS.items()])
     # items_master: seluruh equipment per slot & tier
     eq_rows = []
     for slot, tiers in EQUIP_NAMES.items():
@@ -412,7 +834,7 @@ def load_star_mults(path=None):
 
 
 def load_perks(path=None):
-    """Return {nama_perk: (tier, deskripsi)} dengan fallback konstanta seed."""
+    """Return {nama_trait: (tier, deskripsi)} dengan fallback konstanta seed."""
     out = {}
     try:
         conn = get_db(path)
@@ -423,8 +845,44 @@ def load_perks(path=None):
             conn.close()
     except sqlite3.Error:
         pass
-    if not out:
-        out = dict(PERKS)
+    # Pastikan seluruh trait baru dari seed selalu tersedia
+    for k, v in TRAITS.items():
+        out.setdefault(k, v)
+    return out
+
+
+# Alias resmi: traits (dahulu perks)
+load_traits = load_perks
+
+
+def load_skills(path=None):
+    """Return {nama_skill: {cls, tier, mp_cost, cd, kind, mult, description}}
+    dengan fallback konstanta seed bila database belum ter-update."""
+    out = {}
+    try:
+        conn = get_db(path)
+        try:
+            for r in conn.execute(
+                    "SELECT name, cls, tier, mp_cost, cd, kind, mult, description FROM skills"):
+                out[r["name"]] = {
+                    "cls": r["cls"] or "Universal",
+                    "tier": r["tier"],
+                    "mp_cost": int(r["mp_cost"]),
+                    "cd": int(r["cd"]),
+                    "kind": r["kind"],
+                    "mult": float(r["mult"]),
+                    "description": r["description"],
+                }
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
+    # Pastikan seluruh 240 skill dari seed selalu tersedia
+    for n, (c, t, mp, cd, k, m, d) in SKILLS.items():
+        out.setdefault(n, {
+            "cls": c, "tier": t, "mp_cost": mp, "cd": cd,
+            "kind": k, "mult": m, "description": d,
+        })
     return out
 
 
@@ -584,6 +1042,7 @@ if __name__ == "__main__":
     print("Database siap: %s" % p)
     print("  hero_names   : %d kombinasi nama" % count_names(p))
     print("  perks        : %d perk" % len(load_perks(p)))
+    print("  skills       : %d skill" % len(load_skills(p)))
     print("  items_master : %d item" % len(load_items(p)))
     print("  class_stats  : %d class" % len(load_class_stats(p)))
     print("  star_mults   : %d star" % len(load_star_mults(p)))
