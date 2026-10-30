@@ -25,7 +25,7 @@ from generate_hero import (Hero, Equipment, Perk, Trait, Skill, HeroGenerator, G
                            roll_random_growth_stats, roll_random_mp_regen,
                            roll_random_skills)
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 GAME_DIR = os.path.dirname(os.path.abspath(__file__))
 # Override path via environment (dipakai pengujian agar TIDAK menyentuh
 # data produksi); default tetap di direktori game.
@@ -405,6 +405,11 @@ class BattleEngine:
             h.stun_turns -= 1
             self.say("  [R%d] %s STUN, giliran dilewati." % (self.round, h.name))
             return
+        # Ketidakstabilan Mental (Hero Synthesis): jika sanity < 40.0,
+        # peluang 20% jiwa di dalam tubuh hero mengamuk / mengambil alih
+        if getattr(h, "sanity", 100.0) < 40.0 and random.random() < 0.20:
+            self._trigger_mental_instability(h, enemies)
+            return
         # AI ITEM: sebelum aksi lain, hero "berpikir" apakah item bawaan
         # lebih bernilai dipakai sekarang (lihat _try_use_battle_item).
         if self._try_use_battle_item(h):
@@ -415,6 +420,76 @@ class BattleEngine:
         # Fallback: serangan dasar ke musuh prioritas
         target = min(enemies, key=lambda e: (e.hp, -e.atk))
         self.basic_attack(h, target)
+
+    def _soul_berserk_attack(self, h, enemies):
+        """Serangan brutal Soul Berserk: target acak, ATK x1.35, abaikan 50% DEF."""
+        if not enemies:
+            return
+        target = random.choice(enemies)
+        base_atk, note = self.atk_with_perks(h, target)
+        eff_dfn = int(target.dfn * 0.50)
+        dmg = self.calc_damage(int(round(base_atk * 1.35)), eff_dfn)
+        self.say("  [R%d] %s [SOUL BERSERK] menerjang %s secara brutal!%s" % (
+            self.round, h.name, target.name, note))
+        self.apply_damage_to_enemy(target, dmg, h.name)
+        lifesteal_pct = (0.20 if h.has("Vampiric") else 0.0) + (0.10 if h.has("Bloodthirst") else 0.0)
+        if lifesteal_pct > 0 and h.alive:
+            heal = max(1, int(dmg * lifesteal_pct))
+            h.hp = min(h.max_hp, h.hp + heal)
+            self.say("    ~~ Lifesteal: %s pulih %d HP" % (h.name, heal))
+
+    def _trigger_mental_instability(self, h, enemies):
+        """Efek sanity kritis (< 40.0): 50% Soul Berserk / 50% Memory Echo."""
+        if random.random() < 0.50:
+            self.say("  [!] Jiwa di dalam tubuh %s mengamuk tak terkendali!" % h.name)
+            self._soul_berserk_attack(h, enemies)
+            return
+        self.say("  [!] Fragmen ingatan tumbal mengambil alih tubuh %s!" % h.name)
+        off_kinds = ("aoe_stun", "aoe_pierce", "aoe_slow", "pierce", "drain", "stun", "single")
+        off_cands = []
+        for sk_name in (getattr(h, "skills", None) or []):
+            info = SKILLS.get(sk_name)
+            if info and info.get("kind") in off_kinds:
+                off_cands.append((sk_name, info))
+        if not off_cands:
+            # Fallback ke Soul Berserk bila hero tidak punya skill ofensif
+            self._soul_berserk_attack(h, enemies)
+            return
+        sk_name, info = random.choice(off_cands)
+        kind = info["kind"]
+        mult = info["mult"]
+        if h.has("Overcharge") and h.max_mp > 0 and h.mana > h.max_mp * 0.70:
+            mult *= 1.30
+        label = "%s (Memory Echo)" % sk_name.upper()
+        # Eksekusi tanpa menguras MP (h.mana tetap utuh)
+        if kind.startswith("aoe"):
+            tier_s = info.get("tier", "Common")
+            stun_c = 0.0
+            if kind == "aoe_stun":
+                stun_c = 0.25 if tier_s == "Legendary" else (0.18 if tier_s == "Epic" else 0.12)
+            self.cast_aoe(h, mult, label, stun_chance=stun_c,
+                          slow=(kind == "aoe_slow"), ignore_def=(kind == "aoe_pierce"))
+            return
+        target = random.choice(enemies)
+        base_atk, note = self.atk_with_perks(h, target)
+        eff_dfn = 0 if kind == "pierce" else target.dfn
+        dmg = self.calc_damage(int(base_atk * mult), eff_dfn)
+        extra = " (ignore DEF)" if kind == "pierce" else ""
+        self.say("  [R%d] %s: %s%s ke %s%s" % (
+            self.round, h.name, label, extra, target.name, note))
+        if kind == "stun":
+            tier_s = info.get("tier", "Common")
+            stun_rate = 0.35 if tier_s in ("Epic", "Legendary") else (0.25 if tier_s == "Rare" else 0.20)
+            if random.random() < stun_rate:
+                target.stun_turns = 1
+                self.say("    !! %s terkena STUN 1 ronde!" % target.name)
+        self.apply_damage_to_enemy(target, dmg, h.name)
+        if kind == "drain" and h.alive:
+            drain_hp = max(1, int(dmg * 0.40))
+            before = h.hp
+            h.hp = min(h.max_hp, h.hp + drain_hp)
+            self.say("    ++ %s menyerap %d HP (%d/%d)" % (
+                h.name, h.hp - before, h.hp, h.max_hp))
 
     # ------------------------- AI: TAS BATTLE -------------------------
     def _try_use_battle_item(self, h):
@@ -956,6 +1031,7 @@ class SaveSystem:
             "pity": {},             # {target_star: attempt gagal beruntun}
             "battle_bag": [],       # Tas Battle: list nama item dibawa battle
             "settings": {"no_action_delay": False},  # pengaturan per-akun
+            "total_synthesized": 0,  # Hero Synthesis: counter sintesis kumulatif
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
 
@@ -1041,6 +1117,7 @@ class SaveSystem:
         state["gems"] = _safe_int(state.get("gems"), 0)
         state["free_gacha"] = _safe_int(state.get("free_gacha"), 0)
         state["floors_cleared"] = _safe_int(state.get("floors_cleared"), 0)
+        state["total_synthesized"] = max(0, _safe_int(state.get("total_synthesized"), 0))
         if migrated:
             print("  [MIGRASI] Savegame v%s dimigrasi ke v%s otomatis "
                   "(roster, progres lantai, dan inventaris dipertahankan)."
@@ -1072,6 +1149,14 @@ def deep_merge(default, old):
         else:
             out[k] = v
     return out
+
+
+def _to_float(v, default=0.0):
+    """Konversi float tahan kotor (save rusak tidak boleh crash)."""
+    try:
+        return float(v)
+    except Exception:
+        return default
 
 
 def ensure_hero_fields(hd):
@@ -1127,6 +1212,11 @@ def ensure_hero_fields(hd):
         "alive": bool(hd.get("alive", True)),
         "hp": _safe_int(hd.get("hp"), 0),
         "blueprints": _safe_int(hd.get("blueprints"), 0),
+        # Hero Synthesis (Tahap 1): default aman untuk save lama v2.2.0
+        "sanity": 100.0,
+        "ego": 50.0,
+        "synth_count": 0,
+        "absorbed_souls": 0,
     }
     out = dict(hd)
     for k, v in defaults.items():
@@ -1141,6 +1231,12 @@ def ensure_hero_fields(hd):
     out["base_stats"] = defaults["base_stats"]
     out["growth_stats"] = defaults["growth_stats"]
     out["mp_regen"] = defaults["mp_regen"]
+    # Hero Synthesis: normalisasi tipe data (string "80" -> 80.0, korup -> default)
+    # dengan klem ke rentang resmi: sanity 0-100, ego 10-100, counter >= 0.
+    out["sanity"] = round(max(0.0, min(100.0, _to_float(out.get("sanity"), 100.0))), 1)
+    out["ego"] = round(max(10.0, min(100.0, _to_float(out.get("ego"), 50.0))), 1)
+    out["synth_count"] = max(0, _safe_int(out.get("synth_count"), 0))
+    out["absorbed_souls"] = max(0, _safe_int(out.get("absorbed_souls"), 0))
     return out
 
 
@@ -1401,12 +1497,16 @@ class Game:
         """Submenu setelah memilih hero: 1. Detail  2. Tambah/Keluarkan party
         3. Kembali."""
         while True:
+            if h.name not in self.roster():
+                return   # hero sudah tiada (mis. tertelan Ego Override)
             print("\n  Hero: %s (%s %s)" % (h.name, "*" * h.star, h.cls))
             print("  1. Detail Hero")
             print("  2. %s" % ("Keluarkan dari Party" if h.name in self.party.members
                                   else "Tambah ke Party"))
             print("  3. Kembali")
-            c = ask_choice("  Pilih > ", ["1", "2", "3"])
+            c = ask_choice("  Pilih > ", ["0", "1", "2", "3"])
+            if c == "0" or c == "3":
+                return
             if c == "1":
                 self.hero_detail_menu(h)
             elif c == "2":
@@ -1420,14 +1520,14 @@ class Game:
                     ok, msg = self.party.add(h, self.roster())
                     print("  " + msg)
                 self.autosave()
-            elif c == "3":
-                return
 
     def hero_detail_menu(self, h):
-        """Layar Detail Hero: Stat, Star/Promotion, Rank (hidden potential),
-        Perks, Skill, Equipment terpasang — plus opsi Ganti/Pasang/Lepas
-        equipment langsung dari layar ini."""
+        """Layar Detail Hero: Stat, Kondisi Mental & Vessel, Traits, Skills,
+        Equipment terpasang — plus opsi Ganti/Pasang/Lepas equipment,
+        Promote Star, dan Synthesize Hero langsung dari layar ini."""
         while True:
+            if h.name not in self.roster():
+                return   # bila hero wadah tertelan Ego Override saat sintesis
             header("DETAIL HERO")
             for ln in h.detail_lines():
                 print("  " + ln)
@@ -1463,9 +1563,14 @@ class Game:
             for i, s in enumerate(slots, 1):
                 eq = h.equipment.get(s)
                 print("   %d. %-9s: %s" % (i, s, eq.describe() if eq else "(kosong)"))
-            print("\n  1. Ganti / Pasang Equipment   2. Lepas Equipment")
-            print("  3. Promote Star (Soulstone/Book)   4. Kembali")
-            c = ask_choice("  Pilih > ", ["1", "2", "3", "4"])
+            print("\n  1. Ganti / Pasang Equipment        2. Lepas Equipment")
+            print("  3. Promote Star (Soulstone/Book)   4. Synthesize Hero")
+            print("  0. Kembali")
+            c = ask_choice("  Pilih > ", ["0", "1", "2", "3", "4", "5"])
+            if c == "0":
+                return
+            if c == "5":
+                return
             if c == "1":
                 self.equip_item_flow(h)
             elif c == "2":
@@ -1475,7 +1580,7 @@ class Game:
                 # material & coins di inventory sebelum bintang naik.
                 self.promotion_menu(h)
             elif c == "4":
-                return
+                self.synthesis_menu(hero=h)
 
     def equip_item_flow(self, hero):
         """Pilih slot -> pilih item dari equip_bag (inventory equipment) ->
@@ -1711,6 +1816,50 @@ class Game:
         self.sync_party()
         return dead
 
+    def sacrifice_hero_cleanup(self, hero_name, salvage_equip=True):
+        """Hero Synthesis (Tahap 1): hapus PERMANEN hero tumbal dari game.
+        Langkah: (1) lepas semua equipment -> kembali ke equip_bag (bila
+        salvage_equip=True; slot di-set None — JANGAN .pop() key slot, gotcha
+        seksi 16: key slot hilang tidak bisa dipilih lagi di menu Ganti/Pasang);
+        (2) keluarkan dari Party; (3) pop dari roster + drop_hero_cache agar
+        identity map Game._hero_cache tetap sinkron (gotcha seksi 12);
+        (4) sinkronkan gen.register_existing bila gen tersedia.
+        Return dict ringkasan: {'found', 'salvaged', 'removed_from_party'}."""
+        summary = {"found": False, "salvaged": 0, "removed_from_party": False}
+        r = self.roster()
+        hero = r.get(hero_name)
+        if hero is None:
+            return summary   # hero tidak ada — diam-diam, tidak crash
+        summary["found"] = True
+        # 1) Salvage equipment terpasang -> equip_bag (slot = None, bukan pop!)
+        if salvage_equip:
+            bag = self.state.setdefault("equip_bag", {})
+            for slot, eq in list(hero.equipment.items()):
+                if eq is not None:
+                    uid = str(self.state.get("equip_seq", 0) + 1)
+                    self.state["equip_seq"] = int(uid)
+                    bag[uid] = eq.to_dict()
+                    hero.equipment[slot] = None   # set None, JANGAN pop key
+                    summary["salvaged"] += 1
+        # 2) Keluarkan dari Party bila ada
+        if hero_name in self.party.members:
+            self.party.remove(hero_name)
+            self.state["party"] = list(self.party.members)
+            summary["removed_from_party"] = True
+        # 3) Hapus dari roster + identity map (WAJIB keduanya)
+        self.state["roster"].pop(hero_name, None)
+        self.drop_hero_cache(hero_name)
+        # 4) Sinkronkan generator: nama & fingerprint tumbal bebas dipakai lagi
+        if getattr(self, "gen", None) is not None:
+            try:
+                self.gen.names.discard(hero_name)
+                self.gen.fingerprints = set()
+                self.gen.names = set()
+                self.gen.register_existing(self.roster())
+            except Exception:
+                pass   # tidak boleh menggagalkan penghapusan
+        return summary
+
     def post_battle_events(self, mode, heroes):
         """HIDDEN BOSS EVENT (Emergency Raid): peluang 15% setelah battle
         Adventure/Tower. Opsi kabur hanya SEBELUM battle (loss 10% coins);
@@ -1846,9 +1995,20 @@ class Game:
             print("  Adventure berakhir. Kembali ke Lobby...")
             return
 
+    def recover_party_sanity(self, heroes, amount=5.0):
+        """Pulihkan sanity hero party yang hidup usai memenangkan battle."""
+        healed = 0
+        for h in heroes:
+            if h.alive and getattr(h, "sanity", 100.0) < 100.0:
+                h.sanity = min(100.0, round(float(h.sanity) + float(amount), 1))
+                healed += 1
+        if healed > 0:
+            print("  ~ Ketegangan jiwa mereda: kondisi mental %d hero membaik." % healed)
+        return healed
+
     def reward_adventure(self, heroes, enemies, lev):
         """Reward menang Adventure: XP (36 x lev), coins 35 x lev,
-        drop Potion 30%, drop Equipment 8% (masuk inventory)."""
+        drop Potion 30%, drop Equipment 8% (masuk inventory), + pulih sanity."""
         xp_each = 36 * max(1, lev)
         coins = 35 * max(1, lev)
         print("\n  === REWARD ===")
@@ -1860,6 +2020,7 @@ class Game:
                     msg += "  << LEVEL UP -> L%d!" % h.level
                     h.refresh()
                 print(msg)
+        self.recover_party_sanity(heroes, 5.0)
         self.state["coins"] += coins
         print("  + %d coins" % coins)
         # Drop potion 30%
@@ -1897,8 +2058,8 @@ class Game:
             print("  PERINGATAN: TIDAK ADA KABUR di Tower. Permadeath aktif!")
             print("\n  1. Masuk lantai berikutnya   2. Ulangi lantai (farm)")
             print("  3. Promosi bintang (Soulstone/Book)   4. Craft Material")
-            print("  0. Kembali")
-            c = ask_choice("  Pilih > ", ["0", "1", "2", "3", "4"])
+            print("  5. Synthesis Chamber                  0. Kembali")
+            c = ask_choice("  Pilih > ", ["0", "1", "2", "3", "4", "5"])
             if c == "0":
                 return
             if c in ("1", "2"):
@@ -1916,6 +2077,8 @@ class Game:
                 self.promotion_menu()
             elif c == "4":
                 self.craft_menu()
+            elif c == "5":
+                self.synthesis_menu()
 
     def tower_floor(self, floor, first_clear=False):
         """NO ESCAPE: begitu konfirmasi masuk, pertempuran WAJIB berakhir
@@ -2005,6 +2168,7 @@ class Game:
                 if ups:
                     print("  + %s LEVEL UP -> L%d!" % (h.name, h.level))
                     h.refresh()
+        self.recover_party_sanity(heroes, 5.0)
         # Gem: dijamin di F%5, 12% selainnya
         if floor % 5 == 0:
             self.state["gems"] += 1
@@ -2125,6 +2289,172 @@ class Game:
             print("  ...GAGAL. Material & sacrifice hilang, coins -50%%. Pity +%d%%." %
                   (5 * (pity + 1)))
             self.state["coins"] = int(self.state["coins"] * 0.5)
+        self.autosave()
+
+    # ==================== HERO SYNTHESIS CHAMBER ====================
+    def synthesis_menu(self, hero=None):
+        """Synthesis Chamber: menyatukan Hero Wadah (Base) dengan Hero Tumbal
+        (Material). Tumbal lenyap permanen (equipment diselamatkan ke equip_bag).
+        RAHASIA: DILARANG menampilkan persentase peluang, angka GM, nilai ego,
+        maupun tier dari Trait/Skill di layar ini."""
+        header("SYNTHESIS CHAMBER — PENYATUAN JIWA")
+        r = self.roster()
+        alive_heroes = [h for h in sorted(r.values(), key=lambda x: x.name) if h.alive]
+        if len(alive_heroes) < 2:
+            print("  ! Butuh minimal 2 hero hidup di roster untuk memasuki Synthesis Chamber.")
+            return
+
+        # 1) Tentukan Hero Wadah (Base)
+        if hero is not None:
+            if not hero.alive or hero.name not in r:
+                print("  ! Hero wadah tidak valid atau sudah gugur.")
+                return
+            base_hero = r[hero.name]
+        else:
+            print("  Pilih HERO WADAH (Base) yang akan menerima serapan jiwa:")
+            for i, cand in enumerate(alive_heroes, 1):
+                in_p = " [PARTY]" if cand.name in self.party.members else ""
+                print("  %3d. %-26s %s %-7s L%-2d | Mental: %-14s | Vessel: %d/%d%s" % (
+                    i, cand.name[:26], "*" * cand.star, cand.cls, cand.level,
+                    cand.mental_status_label(), cand.synth_count, cand.vessel_cap(), in_p))
+            print("    0. Kembali / Batal")
+            c_base = ask_choice(
+                "  Pilih Hero Wadah > ",
+                ["0"] + [str(i) for i in range(1, len(alive_heroes) + 1)],
+            )
+            if c_base == "0":
+                return
+            base_hero = alive_heroes[int(c_base) - 1]
+
+        # 2) Tampilkan ringkasan Hero Wadah + peringatan overload bila vessel penuh
+        cap = base_hero.vessel_cap()
+        print("\n  --- HERO WADAH TERPILIH ---")
+        print("  Nama   : %s (%s %s, Level %d)" % (
+            base_hero.name, "*" * base_hero.star, base_hero.cls, base_hero.level))
+        print("  Mental : %s  |  Kapasitas Vessel: %d/%d  |  Jiwa Terserap: %d" % (
+            base_hero.mental_status_label(), base_hero.synth_count, cap,
+            base_hero.absorbed_souls))
+        print("  Traits : %s" % (", ".join(base_hero.traits) if base_hero.traits else "-"))
+        print("  Skills : %s" % (", ".join(base_hero.skills) if base_hero.skills else "-"))
+        if base_hero.synth_count >= cap:
+            print("\n  [!] PERINGATAN KAPASITAS VESSEL:")
+            print("      Tubuh %s telah mencapai batas daya tampung bintang ini (%d/%d)!" % (
+                base_hero.name, base_hero.synth_count, cap))
+            print("      Memaksakan sintesis akan memicu SOUL OVERLOAD — daya serap merosot")
+            print("      tajam dan guncangan mental meningkat berlipat ganda!")
+
+        # 3) Pilih Hero Tumbal (Material)
+        mat_cands = [h for h in alive_heroes if h.name != base_hero.name]
+        if not mat_cands:
+            print("  ! Tidak ada hero lain yang dapat dijadikan tumbal.")
+            return
+        print("\n  Pilih HERO TUMBAL (Material) yang akan dikorbankan:")
+        for i, mc in enumerate(mat_cands, 1):
+            in_p = " [PARTY]" if mc.name in self.party.members else ""
+            eq_n = sum(1 for eq in mc.equipment.values() if eq is not None)
+            eq_tag = (" [Equip:%d]" % eq_n) if eq_n else ""
+            print("  %3d. %-26s %s %-7s L%-2d | Traits: %s%s%s" % (
+                i, mc.name[:26], "*" * mc.star, mc.cls, mc.level,
+                ", ".join(mc.traits) if mc.traits else "-", in_p, eq_tag))
+        print("    0. Kembali / Batal")
+        c_mat = ask_choice(
+            "  Pilih Hero Tumbal > ",
+            ["0"] + [str(i) for i in range(1, len(mat_cands) + 1)],
+        )
+        if c_mat == "0":
+            return
+        mat_hero = mat_cands[int(c_mat) - 1]
+
+        # 4) Konfirmasi akhir
+        print("\n  === KONFIRMASI RITUAL SYNTHESIS ===")
+        print("  Wadah (Base)     : %s (%s %s L%d)" % (
+            base_hero.name, "*" * base_hero.star, base_hero.cls, base_hero.level))
+        print("  Tumbal (Material): %s (%s %s L%d)" % (
+            mat_hero.name, "*" * mat_hero.star, mat_hero.cls, mat_hero.level))
+        print("  (!) PERINGATAN: Jiwa tumbal akan LENYAP PERMANEN dalam Synthesis Chamber.")
+        print("      Seluruh equipment yang terpasang akan dilepas otomatis ke Inventory.")
+        c_ok = ask_choice("  Jalankan sintesis sekarang? (y/n, 0=batal) > ",
+                          ["0", "y", "n", "Y", "N"])
+        if c_ok == "0":
+            print("  Sintesis dibatalkan.")
+            return
+        if c_ok.lower() == "n":
+            print("  Sintesis dibatalkan.")
+            return
+
+        # 5) Eksekusi sintesis & pembersihan tumbal
+        base_was_in_party = (base_hero.name in self.party.members)
+        mental_before = base_hero.mental_status_label()
+        res = base_hero.synthesize_with(mat_hero)
+        survivor = res["survivor"]
+        deceased = res["deceased"]
+
+        print("\n" + line("-", 62))
+        print("  Rantai cahaya mengunci %s dan %s di tengah Synthesis Chamber..." % (
+            base_hero.name, mat_hero.name))
+        sleep(BATTLE_DELAY)
+        if res["ego_override"]:
+            mental_before = "bergejolak"
+            print("  [!!!] ANOMALI SYNTHESIS CHAMBER — EGO OVERRIDE! [!!!]")
+            print("  Jiwa %s menolak hancur! Kehendaknya yang buas membalikkan" % survivor.name)
+            print("  aliran rantai jiwa dan justru MENELAN tubuh %s bulat-bulat!" % deceased.name)
+        else:
+            print("  Cahaya biru meredup... esensi %s terserap sepenuhnya ke dalam %s." % (
+                deceased.name, survivor.name))
+        if res["overload"]:
+            print("  [!] SOUL OVERLOAD: Kapasitas vessel meluap, kesadaran %s retak hebat!" % (
+                survivor.name))
+
+        cleanup = self.sacrifice_hero_cleanup(deceased.name, salvage_equip=True)
+        if res["ego_override"] and base_was_in_party:
+            if survivor.name not in self.party.members and len(self.party.members) < PARTY_MAX:
+                self.party.add(survivor, self.roster())
+                self.state["party"] = list(self.party.members)
+
+        # 6) Tampilkan hasil pada survivor (TANPA ego, GM, tier, atau persentase)
+        print("\n  === HASIL PENYATUAN JIWA ===")
+        print("  Survivor       : %s (%s %s)" % (
+            survivor.name, "*" * survivor.star, survivor.cls))
+        if res["level_after"] > res["level_before"]:
+            print("  Level          : L%d -> L%d (+%d XP jiwa)" % (
+                res["level_before"], res["level_after"], res["xp_gain"]))
+        else:
+            print("  Level          : L%d (+%d XP jiwa, XP %d/%d)" % (
+                survivor.level, res["xp_gain"], survivor.xp, survivor.xp_needed()))
+
+        sg = res["stat_gains"]
+        b_parts = []
+        for k, lbl, fmt in (("hp", "HP", "+%.1f"), ("atk", "ATK", "+%.1f"),
+                            ("def", "DEF", "+%.1f"), ("spd", "SPD", "+%.2f"),
+                            ("mp", "MP", "+%.1f")):
+            if sg.get(k, 0) > 0:
+                b_parts.append("%s %s" % (lbl, fmt % sg[k]))
+        print("  Serapan Base   : %s" % (", ".join(b_parts) if b_parts else "(batas maksimum tercapai)"))
+
+        gg = res["growth_gains"]
+        g_parts = []
+        for k, lbl, fmt in (("hp", "HP", "+%.2f"), ("atk", "ATK", "+%.2f"),
+                            ("def", "DEF", "+%.2f"), ("spd", "SPD", "+%.3f"),
+                            ("mp", "MP", "+%.2f")):
+            if gg.get(k, 0) > 0:
+                g_parts.append("%s %s/Lv" % (lbl, fmt % gg[k]))
+        print("  Serapan Rise   : %s" % (", ".join(g_parts) if g_parts else "(batas maksimum tercapai)"))
+
+        if res["inherited_skills"]:
+            print("  Skill Diwarisi : %s" % ", ".join(res["inherited_skills"]))
+        if res["inherited_traits"]:
+            print("  Trait Diwarisi : %s" % ", ".join(res["inherited_traits"]))
+
+        print("  Kondisi Mental : %s -> %s  |  Vessel: %d/%d  |  Jiwa Terserap: %d" % (
+            mental_before, survivor.mental_status_label(),
+            survivor.synth_count, survivor.vessel_cap(), survivor.absorbed_souls))
+        if cleanup["salvaged"] > 0:
+            print("  Salvage Equip  : %d equipment milik %s dikembalikan ke Inventory." % (
+                cleanup["salvaged"], deceased.name))
+        print(line("-", 62))
+
+        self.state["total_synthesized"] = _safe_int(self.state.get("total_synthesized"), 0) + 1
+        self.gen.register_existing(self.roster())
         self.autosave()
 
     # ==================== CRAFT MATERIAL (Soul & Essence) ====================

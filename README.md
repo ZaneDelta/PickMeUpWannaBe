@@ -1,7 +1,7 @@
 # PICK ME UP: INFINITE GACHA — Auto-Battle Strategy RPG (CLI)
 
 Game CLI bertema manhwa *Pick Me Up (Infinite Gacha)*. Python 3 stdlib ONLY
-(tidak ada dependency eksternal). Versi game saat ini: **2.2.0**.
+(tidak ada dependency eksternal). Versi game saat ini: **2.3.0**.
 
 Dokumen ini adalah peta lengkap sistem game untuk developer berikutnya:
 semua mekanik, angka, struktur data, keputusan desain, dan **aturan yang
@@ -40,7 +40,7 @@ tidak tersentuh. Lihat seksi "Testing".
 
 ```
 pickmeup/
-├── main.py              # Game loop, UI, BattleEngine, SaveSystem (v2.2.0)
+├── main.py              # Game loop, UI, BattleEngine, SaveSystem (v2.3.0)
 ├── database_setup.py    # Inisialisasi & pembacaan game_database.db (SQLite)
 ├── generate_hero.py     # Hero, Equipment, Perk, HeroGenerator, GachaSystem
 ├── game_database.db     # Database SQLite (jangan diedit manual)
@@ -65,8 +65,8 @@ Ini konsep TERPENTING untuk dipahami sebelum menyentuh kode:
 
 | Lapisan | Isi | Lokasi | Saat update versi |
 |---|---|---|---|
-| **Master data** | nama hero (31.104 kombinasi), 48 traits (tabel `perks`), 240 skills (180 class + 60 universal), 48 item master, konstanta stat & bobot 6 class, pita probabilitas star 1–7 | tabel SQLite & konstanta seed | dikosongkan & **di-seed ulang otomatis** dari konstanta di `database_setup.py` — selalu kembali lengkap |
-| **Data pemain** | inventory, equipment, Tas Battle, roster hero, coins/gems, progres tower, pengaturan | `saves/<username>.json` | **tidak pernah disentuh** patcher |
+| **Master data** | nama hero (31.104 kombinasi), 48 traits (tabel `perks`), 240 skills (180 class + 60 universal), 48 item master, konstanta stat & bobot 6 class, pita probabilitas star 1–7, konstanta `SYNTHESIS_CONFIG` | tabel SQLite & konstanta seed | dikosongkan & **di-seed ulang otomatis** dari konstanta di `database_setup.py` — selalu kembali lengkap |
+| **Data pemain** | inventory, equipment, Tas Battle, roster hero (termasuk `sanity`, `ego`, `synth_count`, `absorbed_souls`), coins/gems, progres tower, `total_synthesized`, pengaturan | `saves/<username>.json` | **tidak pernah disentuh** patcher |
 | **Akun** | username, hash password, salt | tabel `accounts` SQLite | tidak pernah disentuh `force` |
 
 Konsekuensinya: menambah item/nama/perk baru di versi berikutnya cukup
@@ -109,7 +109,8 @@ dbs.backup_db()                         # salin db ke .bak (best-effort)
 - **Mage langka ~3% dari total roll**: bobot class di tabel `class_stats`
   (Mage = 3, class lain = 20). Di-roll TERPISAH dari star agar 3%-nya global.
 - **Hidden Potential (RAHASIA)**: hanya hero 1★, peluang 7% mendapat
-  growth multiplier (GM) 1,5–2,5x + peluang perk Rare/Legendary ekstra.
+  growth multiplier (GM) 1,5–2,5x + peluang perk Rare/Legendary ekstra,
+  serta lonjakan `ego` internal sangat tinggi (`80.0–98.0`).
   Canon: 1★ bisa melampaui 4★/5★ — **star awal bukan batas kekuatan**.
 - **Anti-duplikat ketat**: roster di-key by NAMA, jadi (a) nama wajib unik
   (`gen.names`), (b) fingerprint `(nama, base_tuple, growth_tuple, traits, skills)` wajib unik
@@ -183,7 +184,7 @@ GM_efektif = GM + 0.3 (Chosen One) + 0.5 (Late Bloomer pada level >= 30)
 - Sesi: menu encounter → `1. Lawan / 2. Cari lawan lain / 3. Kabur`.
   **Setelah MENANG, tetap di adventure** (reward → encounter berikutnya).
   Sesi berakhir hanya jika: Kabur dipilih, atau seluruh party tumbang.
-- Reward menang: XP `36 x level musuh`, coins `35 x level`, drop Potion
+- Reward menang: XP `36 x level musuh`, coins `35 x level`, pulih `sanity +5.0` (clamp `100.0`) untuk tiap hero hidup di party, drop Potion
   30% (maks stack 5), drop Equipment 8% → masuk equip_bag.
 - Mengalahkan Hidden Boss Adventure: +1 Gem.
 
@@ -202,11 +203,11 @@ GM_efektif = GM + 0.3 (Chosen One) + 0.5 (Late Bloomer pada level >= 30)
   berakhir Victory atau Total Party Permadeath (draw ronde 50 = kalah).
 - Lantai clear bisa diulang (farm) tanpa batas.
 - Menu Tower: 1. Lantai berikutnya, 2. Ulangi lantai, 3. Promosi bintang,
-  4. Craft Material.
+  4. Craft Material, 5. Synthesis Chamber.
 
 ### Reward Tower
 
-- Coins `35 x (2F)`, XP `36 x (2F)` per hero hidup (berbasis floor, bukan
+- Coins `35 x (2F)`, XP `36 x (2F)`, dan pulih `sanity +5.0` (clamp `100.0`) per hero hidup (berbasis floor, bukan
   level boss).
 - Gem dijamin di floor kelipatan 5; 12% floor lainnya.
 - Equipment: F%10 → 100% epic (tier 3–5); F%5 → 55% rare (tier 3–4);
@@ -244,10 +245,32 @@ GM_efektif = GM + 0.3 (Chosen One) + 0.5 (Late Bloomer pada level >= 30)
   jangan hapus). Material & sacrifice hilang saat GAGAL, coins −50%.
 - Sacrifice hero (tier ≥4): jumlah = target − 3 (4★→1, ..., 7★→4).
   Hero yang diorban HILANG PERMANEN (roster.pop + drop_hero_cache).
-- Saat promosi sukses, `hero.promote_star(target)` dipanggil untuk menaikkan bintang sekaligus me-reroll/meningkatkan `base_stats` dan `growth_stats` mengikuti distribusi persentase star baru (tetap dibatasi maksimum universal `STAT_BASE_MAX` & `STAT_GROWTH_RANGE`).
+- Saat promosi sukses, `hero.promote_star(target)` dipanggil untuk menaikkan bintang sekaligus me-reroll/meningkatkan `base_stats` dan `growth_stats` mengikuti distribusi persentase star baru (tetap dibatasi maksimum universal `STAT_BASE_MAX` & `STAT_GROWTH_RANGE`), serta me-reset `hero.synth_count = 0` agar hero mendapat ruang kapasitas vessel baru di bintang yang lebih tinggi.
 - Akses dari 2 tempat: Tower menu 3 (pilih hero dari daftar) dan
   Detail Hero → "3. Promote Star" (hero langsung ditentukan, target =
   star+1). Satu fungsi: `promotion_menu(hero=None)`.
+
+### Hero Synthesis Chamber
+
+Fitur penyatuan jiwa terinspirasi manhwa *Pick Me Up: Infinite Gacha* — menggabungkan **Hero Wadah (Base)** dengan **Hero Tumbal (Material)** secara permanen. Dapat diakses dari 2 tempat: **Tower → 5. Synthesis Chamber** (`synthesis_menu()`) dan **Detail Hero → 4. Synthesize Hero** (`synthesis_menu(hero=h)`).
+
+- **Konstanta Master (`SYNTHESIS_CONFIG` di `database_setup.py`)**:
+  - `VESSEL_CAP_BY_STAR`: `{1: 3, 2: 5, 3: 7, 4: 10, 5: 14, 6: 18, 7: 25}` — batas aman jumlah sintesis per bintang wadah.
+  - `STAT_ABSORB_RATE_BY_STAR`: `{1: 0.25, 2: 0.32, 3: 0.40, 4: 0.50, 5: 0.60, 6: 0.72, 7: 0.85}` — rasio dasar penyerapan `base_stats` & `growth_stats` dari bintang hero tumbal.
+  - `SANITY_DRAIN_BASE`: `8.0` — beban pengurangan sanity dasar per bintang hero tumbal.
+  - `EGO_OVERRIDE_RATIO`: `1.6` — ambang rasio `ego_tumbal / ego_wadah` pemicu *Reverse Absorption / Ego Override*.
+- **Atribut Jiwa & Vessel pada `Hero` (`generate_hero.py`)**:
+  - `sanity` (`float`, `0.0–100.0`, default `100.0`): kondisi mental hero; ditampilkan deskriptif di UI melalui `mental_status_label()` (`Stabil` ≥ 80, `Gelisah` 40–79, `Retak / Kritis` < 40).
+  - `ego` (`float`, `10.0–100.0`, default migrasi `50.0`): kekuatan ego jiwa (**RAHASIA**, dihitung di `HeroGenerator._roll_ego` dari bintang awal + jumlah/tier internal traits, dan melonjak ke `80.0–98.0` pada hero 1★ dengan Hidden Potential).
+  - `synth_count` (`int`, default `0`): jumlah sintesis pada bintang saat ini (direset ke `0` saat `promote_star`).
+  - `absorbed_souls` (`int`, default `0`): total akumulasi tumbal yang pernah diserap.
+- **Alur Logika Inti (`Hero.synthesize_with(material_hero, rng=None)`)**:
+  1. **Ego Override / Reverse Absorption (Kasus Han Islat)**: bila `material.ego >= base.ego * EGO_OVERRIDE_RATIO`, terdapat peluang internal (berbasis selisih ego, cap 85%) tumbal membalikkan rantai *Synthesis Chamber* dan menelan tubuh wadah (`survivor = material`, `deceased = base`). Bila `base` tadinya berada di `Party`, posisi party otomatis ditempati oleh `survivor`.
+  2. **Kapasitas Wadah & Soul Overload**: bila `survivor.synth_count >= VESSEL_CAP_BY_STAR[survivor.star]`, terjadi *Soul Overload* — rasio serapan stat dipotong 85% (`×0.15`) dan pengurangan `sanity` dikalikan `2.0`.
+  3. **Transfer XP**: menyerap 40%–60% dari akumulasi XP/level tumbal menggunakan `gain_xp()` standar (hingga `MAX_LEVEL = 99`).
+  4. **Penyerapan Stat & `GM` Rahasia**: menyerap proporsi `base_stats` dan `growth_stats` sesuai `STAT_ABSORB_RATE_BY_STAR[deceased.star]` (dengan *diminishing returns* `0.5 ** (survivor.star - deceased.star)` bila bintang tumbal lebih rendah), lalu wajib diklem dengan `clamp_stats()`. Bila `deceased.growth_multiplier > survivor.growth_multiplier`, sebagian selisihnya (25%–35%) terserap diam-diam (cap `2.5`).
+  5. **Pewarisan Skill & Trait**: mewariskan maks 1–2 skill kandidat via `can_inherit_skill()` (total maks 6 skill; skill `taunt` **terkunci ketat** hanya untuk class `Tanker`) dan maks 1 trait kandidat via `try_inherit_trait()` (**HARD CAP 3 Traits** & maks 1 Legendary).
+  6. **Beban Sanity & Pembersihan Tumbal**: mengurangi `sanity` sebesar `SANITY_DRAIN_BASE * star_tumbal * (ego_tumbal / ego_survivor)` (`×2.0` bila overload). Hero yang gugur (`deceased`) dibersihkan lewat `Game.sacrifice_hero_cleanup(deceased.name, salvage_equip=True)` sehingga seluruh equipment kembali ke `equip_bag` (`slot = None`, tanpa `.pop()`), keluar dari `Party`, serta terhapus dari `roster` dan `_hero_cache`.
 
 ### Crafting (CRAFT_RECIPES)
 
@@ -325,6 +348,10 @@ GM_efektif = GM + 0.3 (Chosen One) + 0.5 (Late Bloomer pada level >= 30)
   - Prioritas 2 (Tank): `taunt` (khusus pool class `Tanker`, paksa aggro musuh 2 ronde & buff DEF)
   - Prioritas 3 (Buff Party): `buff_all` (buff ATK + DEF + SPD party) → `buff_atk` (buff ATK party) → `buff_def` (buff DEF party)
   - Prioritas 4 (Ofensif / AoE / CC): dipilih skor dampak tertinggi dari `aoe_cc` (AoE + stun/slow), `aoe` (serangan seluruh musuh), `stun_hit` (single-target + peluang stun), `drain` (serangan + lifesteal HP), `pierce` (serangan abaikan DEF), dan `single` (burst single-target). Trait `Double Cast` (20%) & `Infinite Mana` (+15%) memberi peluang pakai skill tanpa menguras MP; Trait `Overcharge` memperkuat damage skill +30% saat MP > 70%.
+- **Ketidakstabilan Mental (`sanity < 40.0` di `BattleEngine.hero_act`)**: sebelum aksi normal, terdapat peluang `20%` hero mengalami *Mental Instability*:
+  - **50% *Soul Berserk***: menerjang musuh acak dengan serangan fisik brutal (`ATK × 1.35`, mengabaikan 50% DEF musuh).
+  - **50% *Memory Echo***: mengeksekusi salah satu skill ofensif milik hero tanpa menguras MP (`mana`); fallback ke *Soul Berserk* bila tidak memiliki skill ofensif.
+  - Menyelesaikan kemenangan di Adventure maupun Tower memulihkan `sanity +5.0` (clamp `100.0`) bagi seluruh hero hidup di party (`recover_party_sanity`).
 - **AI musuh**: serang Tanker yang sedang Taunt dulu, selain itu random.
   Caster: 50% splash 50% dmg ke hero acak lain.
 - **Permadeath**: HP hero 0 = mati PERMANEN. Urutan penyelamat:
@@ -344,12 +371,12 @@ GM_efektif = GM + 0.3 (Chosen One) + 0.5 (Late Bloomer pada level >= 30)
 
 ## 12. Save System & Migrasi (BACA SEBELUM MENGUBAH)
 
-- Save per-akun: `saves/<username>.json`, versi `"game_version": "2.2.0"`.
+- Save per-akun: `saves/<username>.json`, versi `"game_version": "2.3.0"`.
 - **Migrasi otomatis** (`SaveSystem.load`):
   1. File korup → coba `.bak` → kalau gagal, state default (TIDAK crash).
   2. `deep_merge(default_state, data_lama)` — key baru otomatis dapat
-     fallback (equip_bag, battle_bag, settings, dll).
-  3. `ensure_hero_fields(hd)` per hero — field baru diisi default,
+     fallback (`equip_bag`, `battle_bag`, `settings`, `total_synthesized`, dll).
+  3. `ensure_hero_fields(hd)` per hero — field baru diisi default (termasuk `sanity: 100.0`, `ego: 50.0`, `synth_count: 0`, `absorbed_souls: 0`),
      tipe salah dinormalisasi (mis. star "3" → 3).
   4. Migrasi spesifik: `StarFragment` (material lama) → `Low Soulstone`
      konversi 1:1.
@@ -396,7 +423,7 @@ Daftar ini adalah permintaan eksplisit user — melanggarnya = regresi:
 3. **Jangan menampilkan Hidden Potential** (label tier, angka GM, marker
    hasil gacha). Mekaniknya bekerja diam-diam; pemain tidak boleh tahu
    hero mana yang istimewa.
-3b. **Jangan menampilkan tier dari Traits maupun Skills** (Common/Rare/Epic/Legendary) di UI pemain — tier bersifat rahasia dan hanya untuk bobot roll internal.
+3b. **Jangan menampilkan tier dari Traits maupun Skills** (Common/Rare/Epic/Legendary), persentase peluang sintesis, maupun nilai **`ego`** di UI pemain — seluruhnya bersifat rahasia dan hanya untuk kalkulasi internal (roll & Hero Synthesis).
 4. **Jangan menghapus progres pemain saat update** — tidak boleh ada kode
    yang menghapus savegame/akun otomatis; migrasi harus selalu additive.
 5. **Jangan menjamin drop raw boss material** (harus 5% murni).
@@ -500,12 +527,15 @@ import main as M
 | `adventure` | sesi adventure + tabel encounter rahasia |
 | `tower_menu`, `tower_floor`, `reward_tower` | Tower NO ESCAPE (boss 3F + minion 2F) |
 | `promotion_menu(hero=None)` | star promotion 1→7 |
+| `synthesis_menu(hero=None)` | Hero Synthesis Chamber (Tower & Detail Hero) |
+| `Hero.synthesize_with` (`generate_hero.py`) | logika inti sintesis, Ego Override, serapan stat/XP/skill/trait & sanity |
 | `craft_menu` | crafting raw → soulstone |
 | `shop_menu` | potion, gacha ticket, mystery box (TANPA material) |
 | `post_battle_events` | Hidden Boss raid pasca-clear Tower |
 | `settings_menu`, `apply_settings` | battle fast mode per-akun |
-| `BattleEngine.run/run_round` | auto-battle core |
+| `BattleEngine.run/run_round`, `_trigger_mental_instability` | auto-battle core + efek sanity kritis (`Soul Berserk` / `Memory Echo`) |
 | `cleanup_after_battle`, `drop_hero_cache` | permadeath |
+| `sacrifice_hero_cleanup`, `recover_party_sanity` | salvage equipment tumbal & hapus permanen; pemulihan sanity pasca-menang |
 
 ---
 
@@ -523,5 +553,5 @@ import main as M
 
 ---
 
-*Dokumentasi terakhir diperbarui pada versi game 2.2.0. Simpan file ini
+*Dokumentasi terakhir diperbarui pada versi game 2.3.0. Simpan file ini
 bersama kode; perbarui setiap mengubah mekanik.*

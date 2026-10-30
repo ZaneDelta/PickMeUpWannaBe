@@ -24,6 +24,9 @@ HIDDEN_CHANCE = 0.07
 HIDDEN_GM_RANGE = (1.5, 2.5)
 # Tier perk: Common 60% / Rare 30% / Epic 9% / Legendary 1%
 TIER_WEIGHT = {"Common": 60, "Rare": 30, "Epic": 9, "Legendary": 1}
+# Ranking numerik tier internal (urutan kekuatan trait/skill). RAHASIA:
+# hanya untuk logika internal (roll, Hero Synthesis), TIDAK ditampilkan di UI.
+TIER_RANK = {"Common": 0, "Rare": 1, "Epic": 2, "Legendary": 3}
 # Harga gacha (coins / gems)
 PRICE_COINS = {1: 500, 10: 4500}
 PRICE_GEMS = {1: 1, 10: 9}
@@ -73,6 +76,15 @@ def _safe_int(v, default=0):
         return int(v)
     except Exception:
         return default
+
+
+def _clamp_float(v, default, lo, hi):
+    """Float aman dari save: gagal diparse -> default; hasil diklem [lo, hi]."""
+    try:
+        x = float(v)
+    except Exception:
+        return default
+    return max(lo, min(hi, x))
 
 
 # ============================ EQUIPMENT ============================
@@ -358,10 +370,12 @@ class Hero:
 
     def __init__(self, name, star, cls, level=1, growth_multiplier=1.0,
                  perks=None, skills=None, base_stats=None, growth_stats=None,
-                 mp_regen_val=None, traits=None):
+                 mp_regen_val=None, traits=None,
+                 sanity=100.0, ego=50.0, synth_count=0, absorbed_souls=0):
         self.name = name
         self.star = int(star)
         self.cls = cls
+        self.hero_class = cls
         self.level = max(1, int(level))
         self.xp = 0
         self.growth_multiplier = float(growth_multiplier)
@@ -390,6 +404,17 @@ class Hero:
         self.equipment = {"Senjata": None, "Zirah": None, "Aksesori": None}
         self.alive = True
         self.blueprints = 0
+        # --- Hero Synthesis (Tahap 1): kondisi jiwa & kapasitas vessel ---
+        # sanity         : kondisi mental 0.0-100.0 (berkurang saat mensintesis)
+        # ego            : kekuatan ego jiwa 10.0-100.0 (RAHASIA — internal saja,
+        #                  TIDAK pernah ditampilkan di UI)
+        # synth_count    : jumlah sintesis pada star saat ini (direset saat
+        #                  promote_star -> kapasitas vessel baru di star lebih tinggi)
+        # absorbed_souls : total tumbal yang pernah diserap (kumulatif permanen)
+        self.sanity = _clamp_float(sanity, 100.0, 0.0, 100.0)
+        self.ego = _clamp_float(ego, 50.0, 10.0, 100.0)
+        self.synth_count = max(0, _safe_int(synth_count, 0))
+        self.absorbed_souls = max(0, _safe_int(absorbed_souls, 0))
         # Battle state (direset tiap battle oleh BattleEngine)
         self.hp = self.max_hp
         self.mana = 0.0
@@ -492,7 +517,272 @@ class Hero:
             new_g.append(round(val_g, decs_g[i]))
         self.base_stats = tuple(new_b)
         self.growth_stats = tuple(new_g)
+        # Hero Synthesis: star baru = kapasitas vessel baru. Hitungan
+        # sintesis direset agar hero mendapat ruang kapasitas penuh
+        # pada bintang yang lebih tinggi (VESSEL_CAP_BY_STAR star baru).
+        self.synth_count = 0
         self.refresh()
+
+    def can_inherit_skill(self, skill_obj):
+        """Validasi skill boleh diwariskan ke hero ini (pondasi Hero
+        Synthesis — dipakai Tahap 2 sebelum menyalin skill tumbal).
+        Aturan yang ditegakkan:
+          1. Duplikasi nama skill TIDAK boleh (hero sudah memilikinya -> False).
+          2. Skill berjenis 'taunt' (provokasi/aggro — seluruh pool Tanker)
+             HANYA boleh dimiliki class Tanker dan TIDAK PERNAH bisa
+             diwariskan ke class lain.
+          3. Skill tidak dikenal (tidak ada di tabel skills) -> False.
+        Skill lintas class non-taunt BOLEH diwariskan (itu inti sintesis:
+        wadah memperoleh skill dari jiwa yang diserap).
+        skill_obj: instance Skill ATAU string nama skill. Return bool."""
+        if isinstance(skill_obj, str):
+            sk = Skill(skill_obj)
+        elif isinstance(skill_obj, Skill):
+            sk = skill_obj
+        else:
+            return False
+        if sk.name in self.skills:
+            return False   # cegah duplikasi nama skill
+        info = _SKILLS.get(sk.name)
+        if not info:
+            return False   # skill tidak dikenal -> tidak valid
+        if sk.kind == "taunt" and self.cls != "Tanker":
+            return False   # Taunt/aggro HANYA untuk class Tanker
+        return True
+
+    def try_inherit_trait(self, new_trait_obj):
+        """Coba wariskan trait ke hero (pondasi Hero Synthesis). Aturan:
+          - HARD CAP 3 traits per hero (tidak bisa dilanggar jalur apapun).
+          - Maksimal 1 trait Legendary per hero.
+          - Slot < 3 -> trait langsung masuk.
+          - Slot penuh -> trait baru HANYA menggantikan trait lama bertier
+            internal LEBIH RENDAH (yang terendah diganti); jika tidak ada,
+            trait baru ditolak.
+          - Duplikat nama trait ditolak.
+        RAHASIA: tier hanya dibaca internal, tidak pernah tampil di UI.
+        new_trait_obj: instance Trait ATAU string nama trait.
+        Return (ok: bool, pesan: str)."""
+        if isinstance(new_trait_obj, str):
+            tr = Trait(new_trait_obj)
+        elif isinstance(new_trait_obj, Trait):
+            tr = new_trait_obj
+        else:
+            return False, "Trait tidak valid."
+        if tr.name in self.traits:
+            return False, "Trait '%s' sudah dimiliki." % tr.name
+        new_rank = TIER_RANK.get(tr.tier, 0)
+        if new_rank == 3 and any(
+                TIER_RANK.get(Trait.tier_of(t), 0) == 3 for t in self.traits):
+            return False, "Ditolak: maksimal 1 trait Legendary per hero."
+        if len(self.traits) < 3:
+            self.traits.append(tr.name)   # in-place: alias self.perks tetap sinkron
+            return True, "Trait '%s' diwariskan (%d/3)." % (tr.name, len(self.traits))
+        # Slot penuh (HARD CAP 3): ganti hanya bila ada trait tier lebih rendah
+        ranks = [(TIER_RANK.get(Trait.tier_of(t), 0), t) for t in self.traits]
+        lowest_rank, lowest_name = min(ranks)
+        if lowest_rank < new_rank:
+            self.traits.remove(lowest_name)   # in-place: alias perks ikut berubah
+            self.traits.append(tr.name)
+            return True, "Trait '%s' menggantikan '%s' (tier internal lebih rendah)." % (
+                tr.name, lowest_name)
+        return False, "Slot trait penuh (3) & tidak ada trait bertier lebih rendah."
+
+    def clamp_stats(self):
+        """Klem stat hero ke rentang master (pondasi Hero Synthesis —
+        dipanggil Tahap 2 setelah penyerapan stat tumbal):
+          - base_stats  : [STAT_BASE_MIN_BY_CLASS[self.hero_class], STAT_BASE_MAX]
+          - growth_stats: STAT_GROWTH_RANGE (min & max sama lintas star/class)
+        Return tuple (base_stats, growth_stats) hasil klem."""
+        mins = db.STAT_BASE_MIN_BY_CLASS.get(
+            self.cls, db.STAT_BASE_MIN_BY_CLASS["Dealer"])
+        maxs = db.STAT_BASE_MAX
+        keys = db.STAT_KEYS
+        # Pembulatan mengikuti konvensi roll: base (1,1,1,2,1), growth (2,2,2,3,2)
+        decs_b = (1, 1, 1, 2, 1)
+        decs_g = (2, 2, 2, 3, 2)
+        new_b = []
+        new_g = []
+        for i, k in enumerate(keys):
+            new_b.append(round(max(mins[k], min(maxs[k], float(self.base_stats[i]))), decs_b[i]))
+            g_lo, g_hi = db.STAT_GROWTH_RANGE[k]
+            new_g.append(round(max(g_lo, min(g_hi, float(self.growth_stats[i]))), decs_g[i]))
+        self.base_stats = tuple(new_b)
+        self.growth_stats = tuple(new_g)
+        return self.base_stats, self.growth_stats
+
+    def vessel_cap(self):
+        """Batas aman jumlah sintesis pada bintang saat ini (master data)."""
+        caps = db.SYNTHESIS_CONFIG["VESSEL_CAP_BY_STAR"]
+        s = max(1, min(MAX_STAR, int(self.star)))
+        return int(caps.get(s, 3))
+
+    def mental_status_label(self):
+        """Deskripsi kondisi mental hero berdasarkan sanity (tanpa bocoran angka rahasia)."""
+        if self.sanity >= 80.0:
+            return "Stabil"
+        if self.sanity >= 40.0:
+            return "Gelisah"
+        return "Retak / Kritis"
+
+    def synthesize_with(self, material_hero, rng=None):
+        """Proses inti Hero Synthesis antara self (Hero Wadah/Base) dan
+        material_hero (Hero Tumbal/Material) memakai konstanta SYNTHESIS_CONFIG.
+        Menangani:
+          1. Ego Override / Reverse Absorption (kasus Han Islat)
+          2. Soul Overload saat melampaui VESSEL_CAP_BY_STAR
+          3. Transfer akumulasi XP & kenaikan level standar (gain_xp)
+          4. Penyerapan proporsional base_stats, growth_stats (+ clamp_stats),
+             serta serapan rahasia GM (growth_multiplier, cap 2.5)
+          5. Pewarisan skill (via can_inherit_skill, maks 6 total) & trait
+             (via try_inherit_trait, HARD CAP 3 & maks 1 Legendary)
+          6. Pengurangan sanity & update synth_count / absorbed_souls
+        Return dict ringkasan lengkap hasil sintesis."""
+        if material_hero is self:
+            raise ValueError("Hero tidak dapat disintesis dengan dirinya sendiri.")
+        rng = rng or random
+        cfg = db.SYNTHESIS_CONFIG
+
+        # 1) Cek Ego Override / Reverse Absorption (RAHASIA)
+        ego_ratio_req = float(cfg["EGO_OVERRIDE_RATIO"])
+        ego_override = False
+        if material_hero.ego >= self.ego * ego_ratio_req:
+            override_chance = min(
+                0.85,
+                max(0.05, 0.25 + (material_hero.ego - self.ego) / 100.0),
+            )
+            if rng.random() < override_chance:
+                ego_override = True
+
+        if ego_override:
+            survivor = material_hero
+            deceased = self
+        else:
+            survivor = self
+            deceased = material_hero
+
+        # 2) Cek Kapasitas Vessel pada bintang survivor saat ini
+        cap = survivor.vessel_cap()
+        overload = survivor.synth_count >= cap
+
+        # 3) Transfer XP & Kenaikan Level (40%-60% dari akumulasi XP/level tumbal)
+        acc_xp = sum(
+            int(round(40 * (lv ** 1.5))) for lv in range(1, max(1, int(deceased.level)))
+        ) + max(0, int(deceased.xp))
+        base_soul_xp = 30 * max(1, int(deceased.star))
+        xp_rate = rng.uniform(0.40, 0.60)
+        xp_gain = max(1, int(round((acc_xp + base_soul_xp) * xp_rate)))
+        level_before = survivor.level
+        survivor.gain_xp(xp_gain)
+        level_after = survivor.level
+
+        # 4) Penyerapan base_stats, growth_stats, & Hidden Potential (GM)
+        absorb_map = cfg["STAT_ABSORB_RATE_BY_STAR"]
+        dec_star = max(1, min(MAX_STAR, int(deceased.star)))
+        sur_star = max(1, min(MAX_STAR, int(survivor.star)))
+        eff_rate = float(absorb_map.get(dec_star, 0.25))
+        if dec_star < sur_star:
+            eff_rate *= 0.5 ** (sur_star - dec_star)
+        if overload:
+            eff_rate *= 0.15  # penalti Soul Overload: serapan dipotong 85%
+
+        survivor.clamp_stats()
+        old_b = tuple(survivor.base_stats)
+        old_g = tuple(survivor.growth_stats)
+
+        new_b_raw = []
+        new_g_raw = []
+        for i in range(len(db.STAT_KEYS)):
+            pos_diff_b = max(0.0, float(deceased.base_stats[i]) - old_b[i])
+            frac_b = float(deceased.base_stats[i]) * 0.12
+            gain_b = (pos_diff_b * 0.65 + frac_b) * eff_rate
+            new_b_raw.append(old_b[i] + gain_b)
+
+            pos_diff_g = max(0.0, float(deceased.growth_stats[i]) - old_g[i])
+            frac_g = float(deceased.growth_stats[i]) * 0.10
+            gain_g = (pos_diff_g * 0.65 + frac_g) * eff_rate
+            new_g_raw.append(old_g[i] + gain_g)
+
+        survivor.base_stats = tuple(new_b_raw)
+        survivor.growth_stats = tuple(new_g_raw)
+        # WAJIB clamp_stats agar tidak pernah menembus STAT_BASE_MAX / STAT_GROWTH_RANGE
+        survivor.clamp_stats()
+
+        decs_b = (1, 1, 1, 2, 1)
+        decs_g = (2, 2, 2, 3, 2)
+        stat_gains = {
+            k: round(max(0.0, survivor.base_stats[i] - old_b[i]), decs_b[i])
+            for i, k in enumerate(db.STAT_KEYS)
+        }
+        growth_gains = {
+            k: round(max(0.0, survivor.growth_stats[i] - old_g[i]), decs_g[i])
+            for i, k in enumerate(db.STAT_KEYS)
+        }
+
+        # Serapan rahasia GM (Hidden Potential): diam-diam, maks 2.5
+        if deceased.growth_multiplier > survivor.growth_multiplier:
+            gm_diff = deceased.growth_multiplier - survivor.growth_multiplier
+            gm_share = rng.uniform(0.25, 0.35) * (0.15 if overload else 1.0)
+            survivor.growth_multiplier = min(
+                2.5, round(survivor.growth_multiplier + gm_diff * gm_share, 4)
+            )
+
+        # 5) Pewarisan Skill (maks 1-2 per sintesis, total maks 6 skill, non-Taunt utk non-Tanker)
+        MAX_HERO_SKILLS = 6
+        inherited_skills = []
+        skill_cands = [sk for sk in deceased.skills if survivor.can_inherit_skill(sk)]
+        if skill_cands and len(survivor.skills) < MAX_HERO_SKILLS:
+            shuffled_sk = list(skill_cands)
+            rng.shuffle(shuffled_sk)
+            for idx_sk, sk_name in enumerate(shuffled_sk):
+                if len(inherited_skills) >= 2 or len(survivor.skills) >= MAX_HERO_SKILLS:
+                    break
+                if not survivor.can_inherit_skill(sk_name):
+                    continue
+                base_prob = 0.65 if idx_sk == 0 else 0.30
+                if overload:
+                    base_prob *= 0.35
+                if rng.random() < base_prob:
+                    survivor.skills.append(sk_name)
+                    inherited_skills.append(sk_name)
+
+        # 6) Pewarisan Trait (maks 1 kandidat, patuh HARD CAP 3 & maks 1 Legendary)
+        inherited_traits = []
+        trait_cands = [tr for tr in deceased.traits if tr not in survivor.traits]
+        if trait_cands:
+            cand_tr = rng.choice(trait_cands)
+            tr_prob = 0.20 if overload else 0.55
+            if rng.random() < tr_prob:
+                ok_tr, _ = survivor.try_inherit_trait(cand_tr)
+                if ok_tr:
+                    inherited_traits.append(cand_tr)
+
+        # 7) Pengurangan Sanity & Update Counter
+        drain_base = float(cfg["SANITY_DRAIN_BASE"])
+        ego_factor = float(deceased.ego) / max(10.0, float(survivor.ego))
+        raw_sanity_loss = drain_base * dec_star * ego_factor
+        if overload:
+            raw_sanity_loss *= 2.0
+        sanity_loss = round(max(1.0, raw_sanity_loss), 1)
+        survivor.sanity = max(0.0, min(100.0, round(survivor.sanity - sanity_loss, 1)))
+        survivor.synth_count += 1
+        survivor.absorbed_souls += 1 + max(0, int(deceased.absorbed_souls))
+        deceased.alive = False
+        survivor.refresh()
+
+        return {
+            "survivor": survivor,
+            "deceased": deceased,
+            "ego_override": ego_override,
+            "overload": overload,
+            "level_before": level_before,
+            "level_after": level_after,
+            "xp_gain": xp_gain,
+            "stat_gains": stat_gains,
+            "growth_gains": growth_gains,
+            "inherited_skills": inherited_skills,
+            "inherited_traits": inherited_traits,
+            "sanity_loss": sanity_loss,
+        }
 
     def _final_stat(self, idx, use_equip=True):
         v = self._base_stat(idx)
@@ -652,6 +942,12 @@ class Hero:
             "alive": self.alive,
             "hp": self.hp,   # persist wound state (Heal/Rest jadi berarti)
             "blueprints": _safe_int(getattr(self, "blueprints", 0), 0),
+            # Hero Synthesis (Tahap 1): kondisi jiwa & kapasitas vessel.
+            # RAHASIA: ego TIDAK boleh ditampilkan di UI pemain.
+            "sanity": float(self.sanity),
+            "ego": float(self.ego),
+            "synth_count": int(self.synth_count),
+            "absorbed_souls": int(self.absorbed_souls),
         }
 
     @classmethod
@@ -727,7 +1023,13 @@ class Hero:
         if h.hp == 0 and h.alive:
             h.hp = 1   # guard: hero hidup tidak boleh HP 0 dari save rusak
         # ensure_fields: field baru versi berikutnya (future-proof)
-        h.blueprints = _safe_int(d.get("blueprints", 0), 0)
+        h.blueprints = _safe_int(d.get("blueprints"), 0)
+        # Hero Synthesis (Tahap 1): default aman + normalisasi tipe untuk
+        # save lama yang belum punya keempat field ini.
+        h.sanity = _clamp_float(d.get("sanity"), 100.0, 0.0, 100.0)
+        h.ego = _clamp_float(d.get("ego"), 50.0, 10.0, 100.0)
+        h.synth_count = max(0, _safe_int(d.get("synth_count"), 0))
+        h.absorbed_souls = max(0, _safe_int(d.get("absorbed_souls"), 0))
         return h
 
     def detail_lines(self):
@@ -749,6 +1051,9 @@ class Hero:
             "Class  : %s  |  Star: %s  |  Level: %d  (XP %d/%d)" % (
                 self.cls, "*" * self.star, self.level, self.xp, self.xp_needed()),
             "Status : %s" % ("HIDUP" if self.alive else "GUGUR"),
+            "Mental : %s  |  Vessel: %d/%d  |  Jiwa Terserap: %d" % (
+                self.mental_status_label(), self.synth_count,
+                self.vessel_cap(), self.absorbed_souls),
             "Traits : %s" % (", ".join(self.traits) if self.traits else "(tidak ada)"),
             "Skills : %s" % (" | ".join(sk_parts) if sk_parts else "(tidak ada)"),
             "HP %d/%d  ATK %d  DEF %d  SPD %d  MP %d/%d  (regen %d/ronde)" % (
@@ -851,6 +1156,35 @@ class HeroGenerator:
             roll_random_mp_regen(star, rng),
         )
 
+    def _roll_ego(self, cls, star, traits, hidden=False, rng=None):
+        """Roll kekuatan EGO jiwa hero (RAHASIA — hanya dipakai internal
+        Hero Synthesis, TIDAK PERNAH ditampilkan di UI pemain).
+        Pondasi mekanik: ego menentukan siapa memakan siapa saat sintesis
+        (Reverse Absorption / Ego Override, ambang EGO_OVERRIDE_RATIO).
+        Formula:
+          dasar     : 24.0 + 6.0 * star (1★=30.0 .. 7★=66.0)
+          trait     : +2.0 per tingkat tier internal trait (Common..Legendary),
+                      +8.0 ekstra per trait Legendary
+          hidden    : 1★ dengan Hidden Potential (GM 1.5-2.5x) -> LONJAKAN
+                      80.0-98.0 (canon: jiwa kecil berbakat bisa melahap
+                      tuan rumahnya saat sintesis)
+          noise     : ±5.0 (karakter jiwa unik per individu)
+        Hasil diklem rentang ego 10.0-100.0."""
+        rng = rng or random
+        s = max(1, min(MAX_STAR, int(star)))
+        ego = 24.0 + 6.0 * s
+        tier_rank = {"Common": 0, "Rare": 1, "Epic": 2, "Legendary": 3}
+        for t in (traits or []):
+            rank = tier_rank.get(Trait.tier_of(t), 0)
+            ego += 2.0 * rank
+            if rank == 3:
+                ego += 8.0
+        if hidden and s == 1:
+            ego = rng.uniform(80.0, 98.0)
+            return round(max(80.0, min(98.0, ego)), 1)
+        ego += rng.uniform(-5.0, 5.0)
+        return round(max(10.0, min(100.0, ego)), 1)
+
     def create(self, star, cls=None, rng=None):
         """Buat hero unik dari data database. Return instance Hero.
         Setiap hero memiliki stat dasar, growth, mp_regen, traits (1-3),
@@ -880,9 +1214,10 @@ class HeroGenerator:
             traits = self._roll_traits(star, rare_extra, rng)
             skills = self._roll_skills(cls, star, rare_extra, rng)
             b_stats, g_stats, mpr = self._roll_stats(cls, star, rng)
+            ego_val = self._roll_ego(cls, star, traits, rare_extra, rng)
             hero = Hero(name, star, cls, 1, gm, traits,
                         skills=skills, base_stats=b_stats,
-                        growth_stats=g_stats, mp_regen_val=mpr)
+                        growth_stats=g_stats, mp_regen_val=mpr, ego=ego_val)
             fp = hero.fingerprint()
             if fp not in self.fingerprints:
                 self.fingerprints.add(fp)
@@ -898,9 +1233,10 @@ class HeroGenerator:
             traits = self._roll_traits(star, rare_extra, rng)
             skills = self._roll_skills(cls, star, rare_extra, rng)
             b_stats, g_stats, mpr = self._roll_stats(cls, star, rng)
+            ego_val = self._roll_ego(cls, star, traits, rare_extra, rng)
             hero = Hero(name, star, cls, 1, gm, traits,
                         skills=skills, base_stats=b_stats,
-                        growth_stats=g_stats, mp_regen_val=mpr)
+                        growth_stats=g_stats, mp_regen_val=mpr, ego=ego_val)
             self.fingerprints.add(hero.fingerprint())
             self.names.add(name)
             return hero

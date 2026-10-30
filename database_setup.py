@@ -582,6 +582,46 @@ SOULSTONE_ITEMS = {
 }
 
 
+# ===================== HERO SYNTHESIS (MASTER KONSTANTA) =====================
+# Konstanta master mekanik Hero Synthesis (terinspirasi manhwa "Pick Me Up:
+# Infinite Gacha"). Sesuai arsitektur Dua Lapisan Data (README seksi 3):
+# SEMUA angka di bawah adalah master data (di sini); data pemain tetap di
+# saves/<username>.json. RAHASIA: nilai-nilai ini TIDAK pernah ditampilkan
+# ke pemain di UI apapun (aturan seksi 14).
+VESSEL_CAP_BY_STAR = {1: 3, 2: 5, 3: 7, 4: 10, 5: 14, 6: 18, 7: 25}
+STAT_ABSORB_RATE_BY_STAR = {
+    1: 0.25,
+    2: 0.32,
+    3: 0.40,
+    4: 0.50,
+    5: 0.60,
+    6: 0.72,
+    7: 0.85,
+}
+SANITY_DRAIN_BASE = 8.0
+EGO_OVERRIDE_RATIO = 1.6
+
+SYNTHESIS_CONFIG = {
+    # Batas aman jumlah sintesis (penyerapan tumbal) per star WADAH (1★-7★).
+    # Contoh: hero 3★ hanya bisa menyerap maksimal 7 tumbal pada star itu;
+    # promote_star() mereset synth_count sehingga kapasitas baru terbuka.
+    "VESSEL_CAP_BY_STAR": dict(VESSEL_CAP_BY_STAR),
+    # Rasio dasar penyerapan base_stats & growth_stats dari hero TUMBAL,
+    # di-key menurut star TUMBAL (1★-7★). Contoh: menyerap tumbal 4★
+    # menambahkan 50% base/growth stat tumbal ke wadah (dipakai di Tahap 2).
+    "STAT_ABSORB_RATE_BY_STAR": dict(STAT_ABSORB_RATE_BY_STAR),
+    # Beban sanity dasar PER BINTANG hero tumbal:
+    #   drain = SANITY_DRAIN_BASE * star_tumbal
+    # Contoh: tumbal 4★ membebani sanity wadah 8.0 x 4 = 32.0 poin (0-100).
+    "SANITY_DRAIN_BASE": SANITY_DRAIN_BASE,
+    # Ambang Reverse Absorption / Ego Override (RAHASIA): bila
+    # ego_tumbal / ego_wadah >= rasio ini, tumbal membalikkan keadaan dan
+    # memakan wadahnya. Hero 1★ Hidden Potential (ego 80-98) adalah kandidat
+    # utama — canon: jiwa kecil bisa melahap tuan rumahnya.
+    "EGO_OVERRIDE_RATIO": EGO_OVERRIDE_RATIO,
+}
+
+
 # ===================== INISIALISASI DATABASE =====================
 def get_db(path=None, timeout=5.0):
     """Buka koneksi SQLite (row factory dict-like). Database dibuat otomatis.

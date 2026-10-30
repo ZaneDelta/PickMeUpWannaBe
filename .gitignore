@@ -1,6 +1,7 @@
 # Abaikan semua folder __pycache__ dan isinya
 __pycache__/
 *.pyc
+"plan to mobile app"/
 
 # Abaikan semua isi folder saves, tapi tetap pertahankan foldernya
 saves/*
