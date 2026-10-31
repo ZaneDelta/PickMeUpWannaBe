@@ -38,9 +38,13 @@ MAX_STAR = 7
 # saat runtime; menghemat ribuan query per battle).
 _CLASS_STATS = db.load_class_stats()
 _STAR_MULTS = db.load_star_mults()
-_PERKS = db.load_perks()
+_TRAITS = db.load_traits()
+_PERKS = _TRAITS
 _SKILLS = db.load_skills()
 _ITEMS = db.load_items()
+
+get_overload_success_rate = db.get_overload_success_rate
+HERO_SELL_CONFIG = getattr(db, "HERO_SELL_CONFIG", {})
 
 CLASSES = list(_CLASS_STATS.keys()) if _CLASS_STATS else \
     ["Tanker", "Dealer", "Archer", "Healer", "Buffer", "Mage"]
@@ -48,10 +52,11 @@ CLASSES = list(_CLASS_STATS.keys()) if _CLASS_STATS else \
 
 def reload_db_data():
     """Paksa muat ulang cache dari database (mis. setelah re-seed manual)."""
-    global _CLASS_STATS, _STAR_MULTS, _PERKS, _SKILLS, _ITEMS, CLASSES
+    global _CLASS_STATS, _STAR_MULTS, _TRAITS, _PERKS, _SKILLS, _ITEMS, CLASSES
     _CLASS_STATS = db.load_class_stats()
     _STAR_MULTS = db.load_star_mults()
-    _PERKS = db.load_perks()
+    _TRAITS = db.load_traits()
+    _PERKS = _TRAITS
     _SKILLS = db.load_skills()
     _ITEMS = db.load_items()
     CLASSES = list(_CLASS_STATS.keys()) if _CLASS_STATS else CLASSES
@@ -162,23 +167,191 @@ class Equipment:
 
 
 # =============================== TRAIT & SKILL ===============================
+class AbilityTag(str):
+    """Subclass `str` yang tetap 100% kompatibel sebagai string nama skill/trait
+    (untuk equality `==`, `in`, `join`, JSON dump, dsb.) SEKALIGUS mendukung
+    akses dict-like (`.get("cursed")`, `["cursed"]`, `"cursed" in item`) untuk
+    atribut metadata seperti `cursed`, `name`, `tier`, dan `description`."""
+
+    def __new__(tag_type, name, cursed=False, tier="Common", description="", **extra):
+        if isinstance(name, dict):
+            cursed = bool(name.get("cursed", cursed))
+            tier = str(name.get("tier", tier))
+            description = str(name.get("description", name.get("desc", description)))
+            extra_copy = {k: v for k, v in name.items()
+                          if k not in ("name", "cursed", "tier", "description", "desc")}
+            extra_copy.update(extra)
+            extra = extra_copy
+            name = str(name.get("name", ""))
+        elif isinstance(name, AbilityTag):
+            cursed = bool(getattr(name, "cursed", cursed))
+            tier = str(getattr(name, "tier", tier))
+            description = str(getattr(name, "description", description))
+            extra_copy = dict(getattr(name, "_extra", {}))
+            extra_copy.update(extra)
+            extra = extra_copy
+            name = str(name)
+        obj = super().__new__(tag_type, str(name))
+        obj.cursed = bool(cursed)
+        obj.tier = str(tier)
+        obj.description = str(description)
+        obj.desc = obj.description
+        obj._extra = dict(extra)
+        return obj
+
+    def _meta_dict(self):
+        d = {
+            "name": str(self),
+            "cursed": bool(self.cursed),
+            "tier": self.tier,
+            "description": self.description,
+            "desc": self.description,
+        }
+        d.update(self._extra)
+        return d
+
+    def get(self, key, default=None):
+        return self._meta_dict().get(key, default)
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            m = self._meta_dict()
+            if key in m:
+                return m[key]
+            raise KeyError(key)
+        return super().__getitem__(key)
+
+    def __contains__(self, item):
+        if item in ("name", "cursed", "tier", "description", "desc") or item in self._extra:
+            return True
+        return super().__contains__(item)
+
+    def keys(self):
+        return self._meta_dict().keys()
+
+    def items(self):
+        return self._meta_dict().items()
+
+    def values(self):
+        return self._meta_dict().values()
+
+    def to_dict(self):
+        return self._meta_dict()
+
+
+def _extract_ability_name(item):
+    if isinstance(item, dict):
+        return str(item.get("name", ""))
+    if hasattr(item, "name") and not isinstance(item, str):
+        return str(item.name)
+    return str(item or "")
+
+
+def _is_cursed_trait(item):
+    if isinstance(item, dict) and "cursed" in item:
+        return bool(item.get("cursed"))
+    if isinstance(item, AbilityTag):
+        return bool(item.cursed)
+    if hasattr(item, "cursed") and not isinstance(item, str):
+        return bool(item.cursed)
+    nm = _extract_ability_name(item)
+    if nm in db.CURSED_TRAITS_POOL:
+        return True
+    t_info = _TRAITS.get(nm)
+    return bool(t_info and t_info[0] == "Cursed")
+
+
+def _is_cursed_skill(item):
+    if isinstance(item, dict) and "cursed" in item:
+        return bool(item.get("cursed"))
+    if isinstance(item, AbilityTag):
+        return bool(item.cursed)
+    if hasattr(item, "cursed") and not isinstance(item, str):
+        return bool(item.cursed)
+    nm = _extract_ability_name(item)
+    if nm in db.CURSED_SKILLS_POOL:
+        return True
+    s_info = _SKILLS.get(nm)
+    if s_info:
+        return bool(s_info.get("cursed", False) or s_info.get("tier") == "Cursed"
+                    or str(s_info.get("kind", "")).startswith("cursed_"))
+    return False
+
+
+def _make_trait_tag(item):
+    nm = _extract_ability_name(item)
+    t_info = _TRAITS.get(nm, ("Common", "Tanpa efek"))
+    tier = t_info[0]
+    desc = t_info[1]
+    cursed = _is_cursed_trait(item)
+    if isinstance(item, dict):
+        tier = str(item.get("tier", tier))
+        desc = str(item.get("description", item.get("desc", desc)))
+    return AbilityTag(nm, cursed=cursed, tier=tier, description=desc)
+
+
+def _make_skill_tag(item):
+    nm = _extract_ability_name(item)
+    s_info = _SKILLS.get(nm) or {
+        "cls": "Universal", "tier": "Common", "mp_cost": 15, "cd": 3,
+        "kind": "single", "mult": 1.5, "description": "Skill", "cursed": False,
+    }
+    cursed = _is_cursed_skill(item)
+    tier = str(s_info.get("tier", "Common"))
+    desc = str(s_info.get("description", "Skill"))
+    extra = {
+        "cls": s_info.get("cls", "Universal"),
+        "mp_cost": int(s_info.get("mp_cost", 15)),
+        "cd": int(s_info.get("cd", 3)),
+        "kind": s_info.get("kind", "single"),
+        "mult": float(s_info.get("mult", 1.5)),
+    }
+    if isinstance(item, dict):
+        tier = str(item.get("tier", tier))
+        desc = str(item.get("description", item.get("desc", desc)))
+        for k in ("cls", "mp_cost", "cd", "kind", "mult"):
+            if k in item:
+                extra[k] = item[k]
+    return AbilityTag(nm, cursed=cursed, tier=tier, description=desc, **extra)
+
+
 class Trait:
-    """Representasi trait (dahulu perk; data dari tabel perks di database).
-    RAHASIA: tier hanya dipakai internal saat roll, TIDAK ditampilkan di UI."""
+    """Representasi trait (data dari tabel traits di database).
+    RAHASIA: tier normal hanya dipakai internal saat roll, TIDAK ditampilkan di UI."""
 
     def __init__(self, name):
-        self.name = name
-        tier, desc = _PERKS.get(name, ("Common", "Tanpa efek"))
+        nm = _extract_ability_name(name)
+        self.name = nm
+        tier, desc = _TRAITS.get(nm, ("Common", "Tanpa efek"))
         self.tier = tier
         self.desc = desc
+        self.description = desc
+        self.cursed = _is_cursed_trait(name)
+
+    def get(self, key, default=None):
+        return self.to_dict().get(key, default)
+
+    def __getitem__(self, key):
+        return self.to_dict()[key]
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "tier": self.tier,
+            "description": self.desc,
+            "desc": self.desc,
+            "cursed": bool(self.cursed),
+        }
 
     @staticmethod
-    def all_names():
-        return list(_PERKS.keys())
+    def all_names(include_cursed=False):
+        if include_cursed:
+            return list(_TRAITS.keys())
+        return [k for k in _TRAITS.keys() if not _is_cursed_trait(k)]
 
     @staticmethod
     def tier_of(name):
-        return _PERKS.get(name, ("Common", ""))[0]
+        return _TRAITS.get(_extract_ability_name(name), ("Common", ""))[0]
 
 
 # Alias backward-compatibility
@@ -187,14 +360,16 @@ Perk = Trait
 
 class Skill:
     """Representasi skill (data dari tabel skills di database).
-    Pool terdiri dari 30 skill per class (6x30=180) + 60 skill Universal (total 240).
-    RAHASIA: tier skill hanya untuk bobot roll, TIDAK ditampilkan di UI."""
+    Pool terdiri dari 30 skill per class (6x30=180) + 60 skill Universal (total 240)
+    + 15 Cursed Skills (khusus kegagalan Soul Overload).
+    RAHASIA: tier skill normal hanya untuk bobot roll, TIDAK ditampilkan di UI."""
 
     def __init__(self, name):
-        self.name = name
-        info = _SKILLS.get(name) or {
+        nm = _extract_ability_name(name)
+        self.name = nm
+        info = _SKILLS.get(nm) or {
             "cls": "Universal", "tier": "Common", "mp_cost": 15, "cd": 3,
-            "kind": "single", "mult": 1.5, "description": "Skill",
+            "kind": "single", "mult": 1.5, "description": "Skill", "cursed": False,
         }
         self.cls = info.get("cls", "Universal")
         self.tier = info["tier"]
@@ -203,14 +378,38 @@ class Skill:
         self.kind = info["kind"]
         self.mult = info["mult"]
         self.desc = info["description"]
+        self.description = info["description"]
+        self.cursed = _is_cursed_skill(name)
+
+    def get(self, key, default=None):
+        return self.to_dict().get(key, default)
+
+    def __getitem__(self, key):
+        return self.to_dict()[key]
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "cls": self.cls,
+            "tier": self.tier,
+            "mp_cost": self.mp_cost,
+            "cd": self.cd,
+            "kind": self.kind,
+            "mult": self.mult,
+            "description": self.desc,
+            "desc": self.desc,
+            "cursed": bool(self.cursed),
+        }
 
     @staticmethod
-    def all_names():
-        return list(_SKILLS.keys())
+    def all_names(include_cursed=False):
+        if include_cursed:
+            return list(_SKILLS.keys())
+        return [k for k in _SKILLS.keys() if not _is_cursed_skill(k)]
 
     @staticmethod
     def info_of(name):
-        return _SKILLS.get(name)
+        return _SKILLS.get(_extract_ability_name(name))
 
 
 def _roll_skewed_value(lo, hi, star=1, band_weights_map=None, rng=None):
@@ -327,12 +526,23 @@ def roll_random_skills(hero_cls="Dealer", star=1, rare_bonus=False, rng=None):
     """Roll skill untuk 1 hero:
       - 1-2 skill dari pool class hero tersebut (30 skill per class)
       - 0-3 skill dari pool Universal (60 skill universal, TANPA Taunt)
-    Jumlah & kualitas bergantung pada keberuntungan (TIER_WEIGHT)."""
+    Jumlah & kualitas bergantung pada keberuntungan (TIER_WEIGHT).
+    PENTING: Cursed skills (cursed == True) TIDAK PERNAH masuk pool gacha normal."""
     rng = rng or random
     if hero_cls not in _CLASS_STATS:
         hero_cls = "Dealer"
-    cls_pool = {s: info for s, info in _SKILLS.items() if info.get("cls") == hero_cls}
-    uni_pool = {s: info for s, info in _SKILLS.items() if info.get("cls") == "Universal"}
+    cls_pool = {
+        s: info for s, info in _SKILLS.items()
+        if info.get("cls") == hero_cls
+        and not info.get("cursed", False)
+        and info.get("tier") != "Cursed"
+    }
+    uni_pool = {
+        s: info for s, info in _SKILLS.items()
+        if info.get("cls") == "Universal"
+        and not info.get("cursed", False)
+        and info.get("tier") != "Cursed"
+    }
 
     # 1) Roll 1-2 Class Skills
     n_cls = weighted_choice([(1, 60), (2, 40)], rng)
@@ -353,7 +563,7 @@ def roll_random_skills(hero_cls="Dealer", star=1, rare_bonus=False, rng=None):
     n_uni = min(3, max(0, n_uni))
     uni_skills, used_leg = _pick_from_skill_pool(uni_pool, n_uni, used_leg, rng)
 
-    return cls_skills + uni_skills
+    return [_make_skill_tag(s) for s in (cls_skills + uni_skills)]
 
 
 # =============================== HERO ===============================
@@ -380,9 +590,7 @@ class Hero:
         self.xp = 0
         self.growth_multiplier = float(growth_multiplier)
         raw_traits = traits if traits is not None else perks
-        self.traits = list(raw_traits) if raw_traits else []
-        # Alias perks -> mengarah ke list traits yang sama untuk kompatibilitas
-        self.perks = self.traits
+        self.traits = [_make_trait_tag(t) for t in (raw_traits or [])]
         # Stat dasar & rise rate unik per individu hero:
         #   - Base stat: minimum per class, maksimum universal, peluang tinggi sesuai star
         #   - Rise rate (growth_stats): min & max sama di semua star, peluang tinggi sesuai star
@@ -399,7 +607,11 @@ class Hero:
         else:
             self.mp_regen_base = roll_random_mp_regen(self.star)
         # Skill acak unik per individu hero (1-2 class skill + 0-3 universal skill)
-        valid_skills = [str(s) for s in (skills or []) if s in _SKILLS]
+        valid_skills = []
+        for s in (skills or []):
+            s_tag = _make_skill_tag(s)
+            if str(s_tag) in _SKILLS:
+                valid_skills.append(s_tag)
         self.skills = valid_skills if valid_skills else roll_random_skills(self.cls, self.star)
         self.equipment = {"Senjata": None, "Zirah": None, "Aksesori": None}
         self.alive = True
@@ -419,15 +631,26 @@ class Hero:
         self.hp = self.max_hp
         self.mana = 0.0
         self.taunt_turns = 0     # ronde tersisa musuh dipaksa menarget hero ini
-        self.buff_atk = 0        # % buff ATK
-        self.buff_def = 0        # % buff DEF
-        self.buff_spd = 0        # % buff SPD
+        self.buff_atk = 0        # % buff/debuff ATK
+        self.buff_def = 0        # % buff/debuff DEF
+        self.buff_spd = 0        # % buff/debuff SPD
+        self.zero_def_turns = 0  # ronde tersisa DEF = 0 (Flesh Sacrifice)
+        self.cursed_aura_active = False  # aktif bila ada rekan party lain ber-trait Cursed Aura
         self.stun_turns = 0
         self.skill_cd = {}       # {nama_skill: sisa cooldown}
         self.used_last_stand = False
         self.used_phoenix = False
         self.last_hit_by = None  # nama musuh terakhir yang memukul (untuk log)
         self.refresh()
+
+    @property
+    def perks(self):
+        """Alias kompatibilitas mundur: mengarah langsung ke list self.traits."""
+        return self.traits
+
+    @perks.setter
+    def perks(self, val):
+        self.traits[:] = [_make_trait_tag(t) for t in (val or [])]
 
     # ---------- Akses data class dari cache database ----------
     @property
@@ -444,7 +667,13 @@ class Hero:
     def fingerprint(self):
         b = self.base_tuple()
         g = self.growth_tuple()
-        return (self.name, b, g, tuple(sorted(self.traits)), tuple(sorted(self.skills)))
+        return (
+            self.name,
+            b,
+            g,
+            tuple(sorted(str(t) for t in self.traits)),
+            tuple(sorted(str(s) for s in self.skills)),
+        )
 
     def base_tuple(self):
         """Tuple base stat unik hero (dibulatkan 2 desimal)."""
@@ -471,12 +700,14 @@ class Hero:
         return skill_name in self.skills
 
     def skill_mp_cost(self, base_cost):
-        """Hitung MP cost efektif setelah trait pengurang biaya MP."""
+        """Hitung MP cost efektif setelah trait pengurang/pelipat biaya MP."""
         cost = float(base_cost)
         if self.has("Spell Weaver"):
             cost *= 0.85
         if self.has("Infinite Mana"):
             cost *= 0.80
+        if self.has("Mana Parasite"):
+            cost *= 2.0
         return max(1, int(round(cost)))
 
     # ----------------------- Stat dasar per level -----------------------
@@ -524,19 +755,25 @@ class Hero:
         self.refresh()
 
     def can_inherit_skill(self, skill_obj):
-        """Validasi skill boleh diwariskan ke hero ini (pondasi Hero
-        Synthesis — dipakai Tahap 2 sebelum menyalin skill tumbal).
-        Aturan yang ditegakkan:
+        """Validasi skill boleh diwariskan ke hero ini saat Hero Synthesis.
+        Aturan yang ditegakkan (TANPA batasan jumlah skill):
           1. Duplikasi nama skill TIDAK boleh (hero sudah memilikinya -> False).
           2. Skill berjenis 'taunt' (provokasi/aggro — seluruh pool Tanker)
              HANYA boleh dimiliki class Tanker dan TIDAK PERNAH bisa
              diwariskan ke class lain.
-          3. Skill tidak dikenal (tidak ada di tabel skills) -> False.
-        Skill lintas class non-taunt BOLEH diwariskan (itu inti sintesis:
-        wadah memperoleh skill dari jiwa yang diserap).
-        skill_obj: instance Skill ATAU string nama skill. Return bool."""
-        if isinstance(skill_obj, str):
-            sk = Skill(skill_obj)
+          3. Cursed Skill (cursed == True) TIDAK BISA diwariskan lewat jalur
+             pewarisan normal (hanya muncul dari kegagalan Soul Overload).
+          4. Skill tidak dikenal (tidak ada di tabel skills) -> False.
+        skill_obj: instance Skill, dict, ATAU string nama skill. Return bool."""
+        if isinstance(skill_obj, dict):
+            sk_name = str(skill_obj.get("name", ""))
+            if skill_obj.get("cursed", False):
+                return False
+            sk = Skill(sk_name)
+        elif isinstance(skill_obj, str):
+            if getattr(skill_obj, "cursed", False):
+                return False
+            sk = Skill(str(skill_obj))
         elif isinstance(skill_obj, Skill):
             sk = skill_obj
         else:
@@ -546,66 +783,84 @@ class Hero:
         info = _SKILLS.get(sk.name)
         if not info:
             return False   # skill tidak dikenal -> tidak valid
+        if sk.cursed or info.get("cursed", False) or info.get("tier") == "Cursed":
+            return False   # Cursed Skill tidak bisa diwariskan
         if sk.kind == "taunt" and self.cls != "Tanker":
             return False   # Taunt/aggro HANYA untuk class Tanker
         return True
 
+    def can_inherit_trait(self, trait_obj):
+        """Validasi trait boleh diwariskan ke hero ini saat Hero Synthesis
+        (TANPA batasan jumlah trait dan TANPA batasan jumlah Legendary):
+          1. Duplikasi nama trait TIDAK boleh.
+          2. Cursed Trait (cursed == True) TIDAK BISA diwariskan lewat jalur
+             pewarisan normal (hanya muncul dari kegagalan Soul Overload).
+          3. Trait harus ada di tabel traits."""
+        if isinstance(trait_obj, dict):
+            tr_name = str(trait_obj.get("name", ""))
+            if trait_obj.get("cursed", False):
+                return False
+            tr = Trait(tr_name)
+        elif isinstance(trait_obj, str):
+            if getattr(trait_obj, "cursed", False):
+                return False
+            tr = Trait(str(trait_obj))
+        elif isinstance(trait_obj, Trait):
+            tr = trait_obj
+        else:
+            return False
+        if tr.name in self.traits:
+            return False
+        if tr.name not in _TRAITS:
+            return False
+        if tr.cursed or _is_cursed_trait(tr.name):
+            return False
+        return True
+
     def try_inherit_trait(self, new_trait_obj):
-        """Coba wariskan trait ke hero (pondasi Hero Synthesis). Aturan:
-          - HARD CAP 3 traits per hero (tidak bisa dilanggar jalur apapun).
-          - Maksimal 1 trait Legendary per hero.
-          - Slot < 3 -> trait langsung masuk.
-          - Slot penuh -> trait baru HANYA menggantikan trait lama bertier
-            internal LEBIH RENDAH (yang terendah diganti); jika tidak ada,
-            trait baru ditolak.
+        """Wariskan trait ke hero saat Hero Synthesis (No-Cap System):
+          - TANPA batasan jumlah trait (bisa menumpuk 4, 5, 10+ traits).
+          - TANPA batasan maksimal 1 trait Legendary saat sintesis.
           - Duplikat nama trait ditolak.
-        RAHASIA: tier hanya dibaca internal, tidak pernah tampil di UI.
-        new_trait_obj: instance Trait ATAU string nama trait.
+          - Cursed Trait (cursed == True) ditolak dari jalur pewarisan normal.
+        new_trait_obj: instance Trait, dict, ATAU string nama trait.
         Return (ok: bool, pesan: str)."""
-        if isinstance(new_trait_obj, str):
-            tr = Trait(new_trait_obj)
+        if isinstance(new_trait_obj, dict):
+            tr_name = str(new_trait_obj.get("name", ""))
+            is_cursed = bool(new_trait_obj.get("cursed", False))
         elif isinstance(new_trait_obj, Trait):
-            tr = new_trait_obj
+            tr_name = new_trait_obj.name
+            is_cursed = new_trait_obj.cursed
+        elif isinstance(new_trait_obj, str):
+            tr_name = str(new_trait_obj)
+            is_cursed = bool(getattr(new_trait_obj, "cursed", False))
         else:
             return False, "Trait tidak valid."
-        if tr.name in self.traits:
-            return False, "Trait '%s' sudah dimiliki." % tr.name
-        new_rank = TIER_RANK.get(tr.tier, 0)
-        if new_rank == 3 and any(
-                TIER_RANK.get(Trait.tier_of(t), 0) == 3 for t in self.traits):
-            return False, "Ditolak: maksimal 1 trait Legendary per hero."
-        if len(self.traits) < 3:
-            self.traits.append(tr.name)   # in-place: alias self.perks tetap sinkron
-            return True, "Trait '%s' diwariskan (%d/3)." % (tr.name, len(self.traits))
-        # Slot penuh (HARD CAP 3): ganti hanya bila ada trait tier lebih rendah
-        ranks = [(TIER_RANK.get(Trait.tier_of(t), 0), t) for t in self.traits]
-        lowest_rank, lowest_name = min(ranks)
-        if lowest_rank < new_rank:
-            self.traits.remove(lowest_name)   # in-place: alias perks ikut berubah
-            self.traits.append(tr.name)
-            return True, "Trait '%s' menggantikan '%s' (tier internal lebih rendah)." % (
-                tr.name, lowest_name)
-        return False, "Slot trait penuh (3) & tidak ada trait bertier lebih rendah."
+        if not tr_name or tr_name not in _TRAITS:
+            return False, "Trait tidak dikenal."
+        if is_cursed or _is_cursed_trait(tr_name):
+            return False, "Cursed Trait tidak dapat diwariskan."
+        if tr_name in self.traits:
+            return False, "Trait '%s' sudah dimiliki." % tr_name
+        self.traits.append(_make_trait_tag(tr_name))
+        return True, "Trait '%s' diwariskan (total %d trait)." % (tr_name, len(self.traits))
 
     def clamp_stats(self):
-        """Klem stat hero ke rentang master (pondasi Hero Synthesis —
-        dipanggil Tahap 2 setelah penyerapan stat tumbal):
-          - base_stats  : [STAT_BASE_MIN_BY_CLASS[self.hero_class], STAT_BASE_MAX]
-          - growth_stats: STAT_GROWTH_RANGE (min & max sama lintas star/class)
-        Return tuple (base_stats, growth_stats) hasil klem."""
-        mins = db.STAT_BASE_MIN_BY_CLASS.get(
-            self.cls, db.STAT_BASE_MIN_BY_CLASS["Dealer"])
+        """Klem stat hero ke batas atas master (STAT_BASE_MAX & batas atas
+        STAT_GROWTH_RANGE), dengan lantai keamanan positif (1.0 untuk base_stats
+        dan 0.01 untuk growth_stats) TANPA memaksa naik ke STAT_BASE_MIN_BY_CLASS
+        agar vessel yang rusak akibat kegagalan Soul Overload tetap menyimpan
+        stat yang hancur."""
         maxs = db.STAT_BASE_MAX
         keys = db.STAT_KEYS
-        # Pembulatan mengikuti konvensi roll: base (1,1,1,2,1), growth (2,2,2,3,2)
         decs_b = (1, 1, 1, 2, 1)
         decs_g = (2, 2, 2, 3, 2)
         new_b = []
         new_g = []
         for i, k in enumerate(keys):
-            new_b.append(round(max(mins[k], min(maxs[k], float(self.base_stats[i]))), decs_b[i]))
-            g_lo, g_hi = db.STAT_GROWTH_RANGE[k]
-            new_g.append(round(max(g_lo, min(g_hi, float(self.growth_stats[i]))), decs_g[i]))
+            new_b.append(round(max(1.0, min(maxs[k], float(self.base_stats[i]))), decs_b[i]))
+            _, g_hi = db.STAT_GROWTH_RANGE[k]
+            new_g.append(round(max(0.01, min(g_hi, float(self.growth_stats[i]))), decs_g[i]))
         self.base_stats = tuple(new_b)
         self.growth_stats = tuple(new_g)
         return self.base_stats, self.growth_stats
@@ -615,6 +870,12 @@ class Hero:
         caps = db.SYNTHESIS_CONFIG["VESSEL_CAP_BY_STAR"]
         s = max(1, min(MAX_STAR, int(self.star)))
         return int(caps.get(s, 3))
+
+    def get_overload_success_rate(self):
+        """Peluang keberhasilan sintesis (RAHASIA — tidak ditampilkan di UI):
+        1.0 selama synth_count < vessel_cap, dan menurun drastis mengikuti
+        OVERLOAD_SUCCESS_CURVE saat melampaui kapasitas vessel."""
+        return db.get_overload_success_rate(self.synth_count, self.vessel_cap())
 
     def mental_status_label(self):
         """Deskripsi kondisi mental hero berdasarkan sanity (tanpa bocoran angka rahasia)."""
@@ -629,13 +890,14 @@ class Hero:
         material_hero (Hero Tumbal/Material) memakai konstanta SYNTHESIS_CONFIG.
         Menangani:
           1. Ego Override / Reverse Absorption (kasus Han Islat)
-          2. Soul Overload saat melampaui VESSEL_CAP_BY_STAR
-          3. Transfer akumulasi XP & kenaikan level standar (gain_xp)
-          4. Penyerapan proporsional base_stats, growth_stats (+ clamp_stats),
-             serta serapan rahasia GM (growth_multiplier, cap 2.5)
-          5. Pewarisan skill (via can_inherit_skill, maks 6 total) & trait
-             (via try_inherit_trait, HARD CAP 3 & maks 1 Legendary)
-          6. Pengurangan sanity & update synth_count / absorbed_souls
+          2. Soul Overload Curve & Vessel Breakdown saat melampaui VESSEL_CAP_BY_STAR
+          3. Cabang GAGAL Overload: decay stat & GM 30%-99% (tanpa batas min class),
+             60% kehancuran tiap skill/trait non-cursed, 50% infeksi Cursed Skill &
+             50% infeksi Cursed Trait, serta penalti sanity 3.0x
+          4. Cabang BERHASIL (Normal maupun Overload Sukses): pewarisan Skill & Trait
+             tanpa batas (Full Inherit / Individual Roll), sistem Resonansi
+             ('full' / 'partial' / 'normal') tanpa potongan 85%, transfer XP,
+             serta pengurangan sanity (1.0x normal / 1.5x overload sukses)
         Return dict ringkasan lengkap hasil sintesis."""
         if material_hero is self:
             raise ValueError("Hero tidak dapat disintesis dengan dirinya sendiri.")
@@ -660,10 +922,147 @@ class Hero:
             survivor = self
             deceased = material_hero
 
-        # 2) Cek Kapasitas Vessel pada bintang survivor saat ini
+        # 2) Cek Kapasitas Vessel & Roll Keberhasilan Soul Overload
         cap = survivor.vessel_cap()
         overload = survivor.synth_count >= cap
+        success_rate = survivor.get_overload_success_rate()
+        if overload:
+            overload_success = (rng.random() < success_rate)
+        else:
+            overload_success = True
+        overload_failed = not overload_success
 
+        dec_star = max(1, min(MAX_STAR, int(deceased.star)))
+        sur_star = max(1, min(MAX_STAR, int(survivor.star)))
+        decs_b = (1, 1, 1, 2, 1)
+        decs_g = (2, 2, 2, 3, 2)
+
+        inherited_skills = []
+        inherited_traits = []
+        broken_skills = []
+        broken_traits = []
+        gained_cursed_skills = []
+        gained_cursed_traits = []
+
+        # =====================================================================
+        # CABANG A: SOUL OVERLOAD GAGAL (VESSEL BREAKDOWN)
+        # =====================================================================
+        if overload_failed:
+            level_before = survivor.level
+            level_after = survivor.level
+            xp_gain = 0
+            resonance = "failed"
+
+            old_b = tuple(survivor.base_stats)
+            old_g = tuple(survivor.growth_stats)
+            old_gm = float(survivor.growth_multiplier)
+
+            decay_lo, decay_hi = cfg.get("OVERLOAD_FAIL_STAT_DECAY_RANGE", (0.30, 0.99))
+            decayed_b = []
+            decayed_g = []
+            for i in range(len(db.STAT_KEYS)):
+                drop_b = rng.uniform(decay_lo, decay_hi)
+                val_b = max(1.0, round(old_b[i] * (1.0 - drop_b), decs_b[i]))
+                decayed_b.append(val_b)
+
+                drop_g = rng.uniform(decay_lo, decay_hi)
+                val_g = max(0.01, round(old_g[i] * (1.0 - drop_g), decs_g[i]))
+                decayed_g.append(val_g)
+
+            survivor.base_stats = tuple(decayed_b)
+            survivor.growth_stats = tuple(decayed_g)
+            survivor.clamp_stats()
+
+            drop_gm = rng.uniform(decay_lo, decay_hi)
+            survivor.growth_multiplier = max(0.01, round(old_gm * (1.0 - drop_gm), 4))
+
+            stat_gains = {
+                k: round(survivor.base_stats[i] - old_b[i], decs_b[i])
+                for i, k in enumerate(db.STAT_KEYS)
+            }
+            growth_gains = {
+                k: round(survivor.growth_stats[i] - old_g[i], decs_g[i])
+                for i, k in enumerate(db.STAT_KEYS)
+            }
+
+            # Kehancuran Skill & Trait non-cursed (peluang 60% per item)
+            destroy_rate = float(cfg.get("OVERLOAD_FAIL_ABILITY_DESTROY_RATE", 0.60))
+            kept_skills = []
+            for sk in list(survivor.skills):
+                if not _is_cursed_skill(sk) and rng.random() < destroy_rate:
+                    broken_skills.append(_make_skill_tag(sk))
+                else:
+                    kept_skills.append(_make_skill_tag(sk))
+            survivor.skills[:] = kept_skills
+
+            kept_traits = []
+            for tr in list(survivor.traits):
+                if not _is_cursed_trait(tr) and rng.random() < destroy_rate:
+                    broken_traits.append(_make_trait_tag(tr))
+                else:
+                    kept_traits.append(_make_trait_tag(tr))
+            survivor.traits[:] = kept_traits
+
+            # Infeksi Cursed Skill (50%) & Cursed Trait (50%)
+            cursed_sk_rate = float(cfg.get("CURSED_SKILL_GAIN_RATE", 0.50))
+            if rng.random() < cursed_sk_rate:
+                c_sk_pool = [
+                    s["name"] for s in db.get_cursed_skills()
+                    if s["name"] not in survivor.skills
+                ]
+                if c_sk_pool:
+                    chosen_c_sk = _make_skill_tag(rng.choice(c_sk_pool))
+                    survivor.skills.append(chosen_c_sk)
+                    gained_cursed_skills.append(chosen_c_sk)
+
+            cursed_tr_rate = float(cfg.get("CURSED_TRAIT_GAIN_RATE", 0.50))
+            if rng.random() < cursed_tr_rate:
+                c_tr_pool = [
+                    t["name"] for t in db.get_cursed_traits()
+                    if t["name"] not in survivor.traits
+                ]
+                if c_tr_pool:
+                    chosen_c_tr = _make_trait_tag(rng.choice(c_tr_pool))
+                    survivor.traits.append(chosen_c_tr)
+                    gained_cursed_traits.append(chosen_c_tr)
+
+            # Penalti Sanity Ekstrem (3.0x) & Update Counter
+            drain_base = float(cfg["SANITY_DRAIN_BASE"])
+            ego_factor = float(deceased.ego) / max(10.0, float(survivor.ego))
+            fail_mult = float(cfg.get("OVERLOAD_FAIL_SANITY_MULT", 3.0))
+            raw_sanity_loss = drain_base * dec_star * ego_factor * fail_mult
+            sanity_loss = round(max(1.0, raw_sanity_loss), 1)
+            survivor.sanity = max(0.0, min(100.0, round(survivor.sanity - sanity_loss, 1)))
+            survivor.synth_count += 1
+            survivor.absorbed_souls += 1 + max(0, int(deceased.absorbed_souls))
+            deceased.alive = False
+            survivor.refresh()
+
+            return {
+                "survivor": survivor,
+                "deceased": deceased,
+                "ego_override": ego_override,
+                "overload": overload,
+                "overload_success": False,
+                "overload_failed": True,
+                "resonance": resonance,
+                "level_before": level_before,
+                "level_after": level_after,
+                "xp_gain": xp_gain,
+                "stat_gains": stat_gains,
+                "growth_gains": growth_gains,
+                "inherited_skills": inherited_skills,
+                "inherited_traits": inherited_traits,
+                "broken_skills": broken_skills,
+                "broken_traits": broken_traits,
+                "gained_cursed_skills": gained_cursed_skills,
+                "gained_cursed_traits": gained_cursed_traits,
+                "sanity_loss": sanity_loss,
+            }
+
+        # =====================================================================
+        # CABANG B: SINTESIS BERHASIL (NORMAL MAUPUN OVERLOAD SUKSES)
+        # =====================================================================
         # 3) Transfer XP & Kenaikan Level (40%-60% dari akumulasi XP/level tumbal)
         acc_xp = sum(
             int(round(40 * (lv ** 1.5))) for lv in range(1, max(1, int(deceased.level)))
@@ -675,15 +1074,67 @@ class Hero:
         survivor.gain_xp(xp_gain)
         level_after = survivor.level
 
-        # 4) Penyerapan base_stats, growth_stats, & Hidden Potential (GM)
+        # 4) Pewarisan Skill & Trait Tanpa Batas (No-Cap) + Evaluasi Resonansi
+        valid_skill_cands = [sk for sk in deceased.skills if survivor.can_inherit_skill(sk)]
+        valid_trait_cands = [tr for tr in deceased.traits if survivor.can_inherit_trait(tr)]
+        total_valid_cands = len(valid_skill_cands) + len(valid_trait_cands)
+
+        full_inherit_map = cfg.get("FULL_INHERIT_RATE_BY_STAR", {})
+        full_inherit_prob = float(full_inherit_map.get(dec_star, 0.10))
+
+        if total_valid_cands > 0 and rng.random() < full_inherit_prob:
+            # Full Inheritance Jackpot: warisi SEMUA skill & trait valid dari tumbal
+            for sk_name in valid_skill_cands:
+                if survivor.can_inherit_skill(sk_name):
+                    tag_sk = _make_skill_tag(sk_name)
+                    survivor.skills.append(tag_sk)
+                    inherited_skills.append(tag_sk)
+            for tr_name in valid_trait_cands:
+                ok_tr, _ = survivor.try_inherit_trait(tr_name)
+                if ok_tr:
+                    inherited_traits.append(_make_trait_tag(tr_name))
+        else:
+            # Roll individual untuk SETIAP skill valid & SETIAP trait valid (tanpa cap)
+            sk_base = float(cfg.get("SINGLE_SKILL_INHERIT_BASE", 0.35))
+            tr_base = float(cfg.get("SINGLE_TRAIT_INHERIT_BASE", 0.25))
+            star_bonus = float(cfg.get("INHERIT_STAR_BONUS", 0.05))
+            sk_prob = min(0.95, sk_base + star_bonus * dec_star)
+            tr_prob = min(0.90, tr_base + star_bonus * dec_star)
+
+            for sk_name in valid_skill_cands:
+                if survivor.can_inherit_skill(sk_name) and rng.random() < sk_prob:
+                    tag_sk = _make_skill_tag(sk_name)
+                    survivor.skills.append(tag_sk)
+                    inherited_skills.append(tag_sk)
+
+            for tr_name in valid_trait_cands:
+                if survivor.can_inherit_trait(tr_name) and rng.random() < tr_prob:
+                    ok_tr, _ = survivor.try_inherit_trait(tr_name)
+                    if ok_tr:
+                        inherited_traits.append(_make_trait_tag(tr_name))
+
+        total_inherited = len(inherited_skills) + len(inherited_traits)
+        if total_valid_cands >= 1 and total_inherited == total_valid_cands:
+            resonance = "full"
+        elif total_inherited >= 1:
+            resonance = "partial"
+        else:
+            resonance = "normal"
+
+        # 5) Penyerapan base_stats, growth_stats, & Hidden Potential (GM)
+        #    (TANPA potongan 85% saat overload berhasil; diperkuat oleh Resonansi)
         absorb_map = cfg["STAT_ABSORB_RATE_BY_STAR"]
-        dec_star = max(1, min(MAX_STAR, int(deceased.star)))
-        sur_star = max(1, min(MAX_STAR, int(survivor.star)))
-        eff_rate = float(absorb_map.get(dec_star, 0.25))
+        base_rate = float(absorb_map.get(dec_star, 0.25))
+        if resonance == "full":
+            absorb_rate = base_rate * float(cfg.get("FULL_RESONANCE_STAT_MULT", 1.50))
+        elif resonance == "partial":
+            absorb_rate = base_rate + float(cfg.get("PARTIAL_RESONANCE_STAT_BONUS", 0.10))
+        else:
+            absorb_rate = base_rate
+
         if dec_star < sur_star:
-            eff_rate *= 0.5 ** (sur_star - dec_star)
-        if overload:
-            eff_rate *= 0.15  # penalti Soul Overload: serapan dipotong 85%
+            absorb_rate *= 0.5 ** (sur_star - dec_star)
+        eff_rate = min(1.0, absorb_rate)
 
         survivor.clamp_stats()
         old_b = tuple(survivor.base_stats)
@@ -704,11 +1155,9 @@ class Hero:
 
         survivor.base_stats = tuple(new_b_raw)
         survivor.growth_stats = tuple(new_g_raw)
-        # WAJIB clamp_stats agar tidak pernah menembus STAT_BASE_MAX / STAT_GROWTH_RANGE
+        # Klem batas atas agar tidak pernah menembus STAT_BASE_MAX / STAT_GROWTH_RANGE
         survivor.clamp_stats()
 
-        decs_b = (1, 1, 1, 2, 1)
-        decs_g = (2, 2, 2, 3, 2)
         stat_gains = {
             k: round(max(0.0, survivor.base_stats[i] - old_b[i]), decs_b[i])
             for i, k in enumerate(db.STAT_KEYS)
@@ -721,47 +1170,19 @@ class Hero:
         # Serapan rahasia GM (Hidden Potential): diam-diam, maks 2.5
         if deceased.growth_multiplier > survivor.growth_multiplier:
             gm_diff = deceased.growth_multiplier - survivor.growth_multiplier
-            gm_share = rng.uniform(0.25, 0.35) * (0.15 if overload else 1.0)
+            if resonance == "full":
+                gm_share = rng.uniform(0.50, 0.75)
+            else:
+                gm_share = rng.uniform(0.25, 0.35)
             survivor.growth_multiplier = min(
                 2.5, round(survivor.growth_multiplier + gm_diff * gm_share, 4)
             )
 
-        # 5) Pewarisan Skill (maks 1-2 per sintesis, total maks 6 skill, non-Taunt utk non-Tanker)
-        MAX_HERO_SKILLS = 6
-        inherited_skills = []
-        skill_cands = [sk for sk in deceased.skills if survivor.can_inherit_skill(sk)]
-        if skill_cands and len(survivor.skills) < MAX_HERO_SKILLS:
-            shuffled_sk = list(skill_cands)
-            rng.shuffle(shuffled_sk)
-            for idx_sk, sk_name in enumerate(shuffled_sk):
-                if len(inherited_skills) >= 2 or len(survivor.skills) >= MAX_HERO_SKILLS:
-                    break
-                if not survivor.can_inherit_skill(sk_name):
-                    continue
-                base_prob = 0.65 if idx_sk == 0 else 0.30
-                if overload:
-                    base_prob *= 0.35
-                if rng.random() < base_prob:
-                    survivor.skills.append(sk_name)
-                    inherited_skills.append(sk_name)
-
-        # 6) Pewarisan Trait (maks 1 kandidat, patuh HARD CAP 3 & maks 1 Legendary)
-        inherited_traits = []
-        trait_cands = [tr for tr in deceased.traits if tr not in survivor.traits]
-        if trait_cands:
-            cand_tr = rng.choice(trait_cands)
-            tr_prob = 0.20 if overload else 0.55
-            if rng.random() < tr_prob:
-                ok_tr, _ = survivor.try_inherit_trait(cand_tr)
-                if ok_tr:
-                    inherited_traits.append(cand_tr)
-
-        # 7) Pengurangan Sanity & Update Counter
+        # 6) Pengurangan Sanity & Update Counter
         drain_base = float(cfg["SANITY_DRAIN_BASE"])
         ego_factor = float(deceased.ego) / max(10.0, float(survivor.ego))
-        raw_sanity_loss = drain_base * dec_star * ego_factor
-        if overload:
-            raw_sanity_loss *= 2.0
+        sanity_mult = float(cfg.get("OVERLOAD_SUCCESS_SANITY_MULT", 1.5)) if overload else 1.0
+        raw_sanity_loss = drain_base * dec_star * ego_factor * sanity_mult
         sanity_loss = round(max(1.0, raw_sanity_loss), 1)
         survivor.sanity = max(0.0, min(100.0, round(survivor.sanity - sanity_loss, 1)))
         survivor.synth_count += 1
@@ -774,6 +1195,9 @@ class Hero:
             "deceased": deceased,
             "ego_override": ego_override,
             "overload": overload,
+            "overload_success": True,
+            "overload_failed": False,
+            "resonance": resonance,
             "level_before": level_before,
             "level_after": level_after,
             "xp_gain": xp_gain,
@@ -781,6 +1205,10 @@ class Hero:
             "growth_gains": growth_gains,
             "inherited_skills": inherited_skills,
             "inherited_traits": inherited_traits,
+            "broken_skills": broken_skills,
+            "broken_traits": broken_traits,
+            "gained_cursed_skills": gained_cursed_skills,
+            "gained_cursed_traits": gained_cursed_traits,
             "sanity_loss": sanity_loss,
         }
 
@@ -788,21 +1216,24 @@ class Hero:
         v = self._base_stat(idx)
         # Trait stat modifier
         if idx == 1:  # ATK
-            if self.has("Glass Cannon"):    v *= 1.40
-            if self.has("Unlucky"):         v *= 1.40
-            if self.has("Chosen One"):      v *= 1.10
-            if self.has("Sharp Edge"):      v *= 1.15
-            if self.has("Reckless Charge"): v *= 1.25
-            if self.has("Thick Armor"):     v *= 0.90
-            if self.has("Fierce Grip"):     v *= 1.12
-            if self.has("Bloodthirst"):     v *= 1.20
-            if self.has("Wind Runner"):     v *= 1.10
-            if self.has("Precision"):       v *= 1.18
-            if self.has("Warlord"):         v *= 1.22
-            if self.has("Soul Harvester"):  v *= 1.20
-            if self.has("Shadow Step"):     v *= 1.15
-            if self.has("Godslayer"):       v *= 1.35
-            if self.has("Celestial Grace"): v *= 1.18
+            if self.has("Glass Cannon"):        v *= 1.40
+            if self.has("Unlucky"):             v *= 1.40
+            if self.has("Chosen One"):          v *= 1.10
+            if self.has("Sharp Edge"):          v *= 1.15
+            if self.has("Reckless Charge"):     v *= 1.25
+            if self.has("Thick Armor"):         v *= 0.90
+            if self.has("Fierce Grip"):         v *= 1.12
+            if self.has("Bloodthirst"):         v *= 1.20
+            if self.has("Wind Runner"):         v *= 1.10
+            if self.has("Precision"):           v *= 1.18
+            if self.has("Warlord"):             v *= 1.22
+            if self.has("Soul Harvester"):      v *= 1.20
+            if self.has("Shadow Step"):         v *= 1.15
+            if self.has("Godslayer"):           v *= 1.35
+            if self.has("Celestial Grace"):     v *= 1.18
+            if self.has("Bloodlust Masochist"): v *= 1.20  # Cursed Trait: ATK +20%
+            if getattr(self, "cursed_aura_active", False):
+                v *= 0.90  # Cursed Aura dari rekan party: ATK -10%
             if self.has("Berserk") and getattr(self, "hp", v) < self.max_hp * 0.5:
                 v *= 1.35
             if self.has("Counter Stance") and getattr(self, "hp", v) < self.max_hp:
@@ -822,6 +1253,9 @@ class Hero:
             if self.has("Dragon Scales"):   v *= 1.30
             if self.has("Immortal Vessel"): v *= 1.25
             if self.has("Celestial Grace"): v *= 1.18
+            if self.has("Fragile Bones"):   v *= 0.60  # Cursed Trait: DEF -40%
+            if getattr(self, "cursed_aura_active", False):
+                v *= 0.90  # Cursed Aura dari rekan party: DEF -10%
             if self.has("Unyielding") and getattr(self, "hp", v) < self.max_hp * 0.5:
                 v *= 1.35
         if idx == 3:  # SPD
@@ -833,6 +1267,8 @@ class Hero:
             if self.has("Wind Runner"):     v *= 1.22
             if self.has("Shadow Step"):     v *= 1.28
             if self.has("Celestial Grace"): v *= 1.18
+            if self.has("Fragile Bones"):   v *= 1.15  # Cursed Trait: SPD +15%
+            if self.has("Severed Nerves"):  v *= 0.65  # Cursed Trait: SPD -35%
         # Equipment & buff battle additif
         if use_equip:
             eq_atk = eq_def = 0
@@ -843,7 +1279,7 @@ class Hero:
                 elif idx == 2: eq_def += eq.dfn
             v += eq_atk + eq_def
         if idx == 3:  # buff SPD hanya saat battle
-            v *= (1 + self.buff_spd / 100.0)
+            v *= max(0.1, 1 + self.buff_spd / 100.0)
         return max(1, int(round(v)))
 
     @property
@@ -861,6 +1297,7 @@ class Hero:
         if self.has("Dragon Scales"):   hp *= 1.30
         if self.has("Immortal Vessel"): hp *= 1.45
         if self.has("Celestial Grace"): hp *= 1.18
+        if self.has("Cracked Vessel"):  hp *= 0.75  # Cursed Trait: Max HP -25%
         hp += self._equipment_hp()
         return max(1, int(round(hp)))
 
@@ -869,13 +1306,16 @@ class Hero:
 
     @property
     def atk(self):
-        # ATK dengan buff battle (additif %, dihitung dari ATK termasuk equip)
-        return max(1, int(round(self._final_stat(1) * (1 + self.buff_atk / 100.0))))
+        # ATK dengan buff/debuff battle (additif %, dihitung dari ATK termasuk equip)
+        return max(1, int(round(self._final_stat(1) * max(0.1, 1 + self.buff_atk / 100.0))))
 
     @property
     def dfn(self):
-        # DEF final + buff DEF battle (Guard Hymn / Taunt) — additif %
-        return max(1, int(round(self._final_stat(2) * (1 + self.buff_def / 100.0))))
+        # Flesh Sacrifice membuat DEF menjadi 0 selama durasi zero_def_turns
+        if getattr(self, "zero_def_turns", 0) > 0:
+            return 0
+        # DEF final + buff/debuff DEF battle — additif %
+        return max(1, int(round(self._final_stat(2) * max(0.1, 1 + self.buff_def / 100.0))))
 
     @property
     def spd(self):
@@ -895,6 +1335,8 @@ class Hero:
 
     @property
     def mp_regen(self):
+        if self.has("Leaking Soul"):
+            return 0  # Cursed Trait: MP Regen menjadi 0
         r = self.mp_regen_base
         if self.has("Calm Spirit"):   r += 2
         if self.has("Arcane Well"):   r += 3
@@ -928,13 +1370,15 @@ class Hero:
 
     # ------------------------- Serialisasi -------------------------
     def to_dict(self):
+        trait_list = [_make_trait_tag(t) for t in self.traits]
+        skill_list = [_make_skill_tag(s) for s in self.skills]
         return {
             "name": self.name, "star": self.star, "cls": self.cls,
             "level": self.level, "xp": self.xp,
             "growth_multiplier": self.growth_multiplier,
-            "traits": list(self.traits),
-            "perks": list(self.traits),   # dipertahankan untuk backward compatibility
-            "skills": list(self.skills),
+            "traits": trait_list,
+            "perks": list(trait_list),   # dipertahankan untuk backward compatibility
+            "skills": skill_list,
             "base_stats": list(self.base_stats),
             "growth_stats": list(self.growth_stats),
             "mp_regen": self.mp_regen_base,
@@ -971,17 +1415,22 @@ class Hero:
         except Exception:
             level = 1
         try:
-            gm = float(d.get("growth_multiplier", 1.0))
+            gm = max(0.01, float(d.get("growth_multiplier", 1.0)))
         except Exception:
             gm = 1.0
+        has_traits_key = ("traits" in d) or ("perks" in d)
         raw_traits = d.get("traits") if d.get("traits") is not None else (d.get("perks") or [])
-        traits = [str(p) for p in raw_traits if p in _PERKS]
+        traits = []
+        for p in (raw_traits or []):
+            t_tag = _make_trait_tag(p)
+            if str(t_tag) in _TRAITS:
+                traits.append(t_tag)
         # RNG deterministik berbasis nama untuk migrasi save lama tanpa stat/skill acak
         mig_rng = random.Random("pmu_hero_mig::" + name)
         raw_bs = d.get("base_stats")
         if isinstance(raw_bs, (list, tuple)) and len(raw_bs) == 5:
             try:
-                base_stats = tuple(float(x) for x in raw_bs)
+                base_stats = tuple(max(1.0, float(x)) for x in raw_bs)
             except Exception:
                 base_stats = roll_random_base_stats(hero_cls, star, mig_rng)
         else:
@@ -989,7 +1438,7 @@ class Hero:
         raw_gs = d.get("growth_stats")
         if isinstance(raw_gs, (list, tuple)) and len(raw_gs) == 5:
             try:
-                growth_stats = tuple(float(x) for x in raw_gs)
+                growth_stats = tuple(max(0.01, float(x)) for x in raw_gs)
             except Exception:
                 growth_stats = roll_random_growth_stats(star, mig_rng)
         else:
@@ -998,13 +1447,23 @@ class Hero:
         mp_regen_val = _safe_int(raw_mpr, 0) if raw_mpr is not None else 0
         if mp_regen_val <= 0:
             mp_regen_val = roll_random_mp_regen(star, mig_rng)
+        has_skills_key = "skills" in d and isinstance(d.get("skills"), list)
         raw_skills = d.get("skills") or []
-        skills = [str(s) for s in raw_skills if s in _SKILLS]
-        if not skills:
+        skills = []
+        for s in raw_skills:
+            s_tag = _make_skill_tag(s)
+            if str(s_tag) in _SKILLS:
+                skills.append(s_tag)
+        if not skills and not has_skills_key:
             skills = roll_random_skills(hero_cls, star, gm >= 1.5, mig_rng)
         h = cls(name, star, hero_cls, level, gm, traits,
                 skills=skills, base_stats=base_stats,
                 growth_stats=growth_stats, mp_regen_val=mp_regen_val)
+        if has_skills_key and not skills:
+            # Jika seluruh skill hancur akibat kegagalan Soul Overload, biarkan kosong
+            h.skills = []
+        if has_traits_key and not traits:
+            h.traits = []
         h.xp = _safe_int(d.get("xp", 0), 0)
         h.alive = bool(d.get("alive", True))
         eq = d.get("equipment") or {}
@@ -1036,16 +1495,25 @@ class Hero:
         """Detail hero untuk layar Detail Hero di menu Manage Hero.
         RAHASIA:
           - hidden potential (growth_multiplier) SENGAJA tidak ditampilkan.
-          - tier dari Traits maupun Skills SENGAJA tidak ditampilkan di UI."""
+          - tier normal dari Traits maupun Skills (Common/Rare/Epic/Legendary)
+            SENGAJA tidak ditampilkan di UI.
+          - KHUSUS Cursed Skill & Cursed Trait WAJIB diberi penanda [CURSED]."""
         eqs = [e.describe() for e in self.equipment.values() if e]
+        tr_parts = []
+        for t in self.traits:
+            if _is_cursed_trait(t):
+                tr_parts.append("%s [CURSED]" % t)
+            else:
+                tr_parts.append(str(t))
         sk_parts = []
         for s in self.skills:
             info = _SKILLS.get(s)
+            cursed_tag = " [CURSED]" if _is_cursed_skill(s) else ""
             if info:
-                sk_parts.append("%s (%d MP, CD %d)" % (
-                    s, self.skill_mp_cost(info["mp_cost"]), info["cd"]))
+                sk_parts.append("%s%s (%d MP, CD %d)" % (
+                    s, cursed_tag, self.skill_mp_cost(info["mp_cost"]), info["cd"]))
             else:
-                sk_parts.append(s)
+                sk_parts.append("%s%s" % (s, cursed_tag))
         return [
             "Nama   : %s" % self.name,
             "Class  : %s  |  Star: %s  |  Level: %d  (XP %d/%d)" % (
@@ -1054,7 +1522,7 @@ class Hero:
             "Mental : %s  |  Vessel: %d/%d  |  Jiwa Terserap: %d" % (
                 self.mental_status_label(), self.synth_count,
                 self.vessel_cap(), self.absorbed_souls),
-            "Traits : %s" % (", ".join(self.traits) if self.traits else "(tidak ada)"),
+            "Traits : %s" % (", ".join(tr_parts) if tr_parts else "(tidak ada)"),
             "Skills : %s" % (" | ".join(sk_parts) if sk_parts else "(tidak ada)"),
             "HP %d/%d  ATK %d  DEF %d  SPD %d  MP %d/%d  (regen %d/ronde)" % (
                 self.hp, self.max_hp, self.atk, self.dfn, self.spd,
@@ -1063,7 +1531,101 @@ class Hero:
                 self.growth_stats[0], self.growth_stats[1], self.growth_stats[2],
                 self.growth_stats[3], self.growth_stats[4]),
             "Equip  : %s" % ("; ".join(eqs) if eqs else "(kosong)"),
+            "Harga Jual: %d coins%s" % (
+                self.calc_sell_price(), " [MAGE PREMIUM 3x]" if str(self.cls).strip().lower() == "mage" else ""),
         ]
+
+    def calc_sell_breakdown(self):
+        """Hitung rincian harga jual hero dalam bentuk dict breakdown:
+        - star_base : Nilai dasar bintang (1★ - 7★)
+        - level_val : Nilai pertumbuhan level hero
+        - stat_val  : Nilai stat efektif (HP, ATK, DEF, SPD, MP)
+        - traits_val: Nilai akumulasi jumlah & kelangkaan (tier) trait
+        - skills_val: Nilai akumulasi jumlah & kelangkaan (tier) skill
+        - subtotal  : Nilai sebelum pengali class
+        - is_mage   : Apakah hero bertipe Mage
+        - mage_mult : Pengali 3.0x jika Mage, 1.0x jika class lain
+        - total_price: Nilai akhir dalam satuan Coins
+        """
+        cfg = getattr(db, "HERO_SELL_CONFIG", None) or HERO_SELL_CONFIG or {}
+        star_bases = cfg.get("BASE_PRICE_BY_STAR", {1: 150, 2: 400, 3: 1000, 4: 3000, 5: 8000, 6: 20000, 7: 50000})
+        star_val = int(star_bases.get(self.star, 150))
+
+        # 1) Level scaling (linear + eksponensial halus)
+        lvl_base = cfg.get("LEVEL_MULT_BASE", 25)
+        lvl_factor = cfg.get("LEVEL_EXP_FACTOR", 10.0)
+        lvl_power = cfg.get("LEVEL_EXP_POWER", 1.3)
+        lvl_val = int(self.level * lvl_base + (self.level ** lvl_power) * lvl_factor)
+
+        # 2) Stat scaling
+        sw = cfg.get("STAT_WEIGHTS", {"hp": 0.5, "atk": 3.0, "def": 2.5, "spd": 4.0, "mp": 0.8})
+        stat_val = int(
+            self.max_hp * sw.get("hp", 0.5) +
+            self.atk * sw.get("atk", 3.0) +
+            self.dfn * sw.get("def", 2.5) +
+            self.spd * sw.get("spd", 4.0) +
+            self.max_mp * sw.get("mp", 0.8)
+        )
+
+        # 3) Traits (jumlah + kelangkaan tier)
+        trait_cnt_val = len(self.traits) * cfg.get("COUNT_VALUE_PER_TRAIT", 100)
+        trait_tier_cfgs = cfg.get("TRAIT_TIER_VALUE", {"Common": 100, "Rare": 300, "Epic": 900, "Legendary": 3000, "Cursed": -100})
+        trait_tier_val = 0
+        for t in self.traits:
+            tier = "Common"
+            if hasattr(t, "tier"):
+                tier = str(t.tier)
+            else:
+                t_info = _TRAITS.get(str(t))
+                if t_info:
+                    tier = t_info[0]
+            if _is_cursed_trait(t):
+                tier = "Cursed"
+            trait_tier_val += trait_tier_cfgs.get(tier, 100)
+        traits_val = trait_cnt_val + trait_tier_val
+
+        # 4) Skills (jumlah + kelangkaan tier)
+        skill_cnt_val = len(self.skills) * cfg.get("COUNT_VALUE_PER_SKILL", 75)
+        skill_tier_cfgs = cfg.get("SKILL_TIER_VALUE", {"Common": 60, "Rare": 180, "Epic": 550, "Legendary": 1800, "Cursed": -50})
+        skill_tier_val = 0
+        for s in self.skills:
+            tier = "Common"
+            if hasattr(s, "tier"):
+                tier = str(s.tier)
+            else:
+                s_info = _SKILLS.get(str(s))
+                if s_info:
+                    tier = s_info.get("tier", "Common")
+            if _is_cursed_skill(s):
+                tier = "Cursed"
+            skill_tier_val += skill_tier_cfgs.get(tier, 60)
+        skills_val = skill_cnt_val + skill_tier_val
+
+        subtotal = max(cfg.get("MIN_PRICE", 100), star_val + lvl_val + stat_val + traits_val + skills_val)
+
+        # 5) Mage multiplier (Canon Pick Me Up: Mage sangat langka & harganya 3x lipat)
+        is_mage = (str(self.cls).strip().lower() == "mage")
+        mage_mult = float(cfg.get("MAGE_MULTIPLIER", 3.0)) if is_mage else 1.0
+
+        total_price = int(round(subtotal * mage_mult))
+        min_p = cfg.get("MIN_PRICE", 100) * (int(mage_mult) if is_mage else 1)
+        total_price = max(min_p, total_price)
+
+        return {
+            "star_base": star_val,
+            "level_val": lvl_val,
+            "stat_val": stat_val,
+            "traits_val": traits_val,
+            "skills_val": skills_val,
+            "subtotal": subtotal,
+            "is_mage": is_mage,
+            "mage_multiplier": mage_mult,
+            "total_price": total_price,
+        }
+
+    def calc_sell_price(self):
+        """Kembalikan total harga jual hero dalam satuan Coins."""
+        return self.calc_sell_breakdown()["total_price"]
 
     def talent_label(self):
         gm = self.growth_multiplier
@@ -1075,13 +1637,13 @@ class Hero:
 # ========================= HERO GENERATOR =========================
 class HeroGenerator:
     """Generator hero prosedural — nama & data ditarik dari SQLite.
-    ATURAN UNIK: tidak ada dua hero dengan (nama, growth, perks) identik.
+    ATURAN UNIK: tidak ada dua hero dengan (nama, growth, traits) identik.
     Duplikat -> regenerasi (maks 200 percobaan, lalu suffix serial)."""
     MAX_TRY = 200
 
     def __init__(self, db_path=None):
         self.db_path = db_path
-        self.fingerprints = set()   # set of (name, growth_tuple, perks_tuple)
+        self.fingerprints = set()   # set of (name, growth_tuple, traits_tuple)
         self.names = set()          # nama terpakai — roster di-key by name
 
     def register_existing(self, roster):
@@ -1096,18 +1658,20 @@ class HeroGenerator:
 
     def _roll_hidden(self, rng):
         """Roll hidden potential (HANYA 1-star): 7% Tier A -> GM 1.5-2.5x
-        + peluang perk Rare/Legendary ekstra. Inilah kenapa 1-star bisa
+        + peluang trait Rare/Legendary ekstra. Inilah kenapa 1-star bisa
         melampaui 4-star bila dirawat (star bukan batas kekuatan)."""
         if rng.random() < HIDDEN_CHANCE:
             return rng.uniform(*HIDDEN_GM_RANGE), True
         return 1.0, False
 
     def _roll_perks(self, star, rare_bonus, rng):
-        """Roll 1-3 perk (pool & tier dari tabel perks di database).
+        """Roll 1-3 trait normal (pool & tier dari tabel traits di database).
         Tier: Common 60% / Rare 30% / Epic 9% / Legendary 1%.
-        Max 1 Legendary per hero. 5-star dijamin minimal 1 Rare+."""
+        Max 1 Legendary per hero saat gacha normal. 5-star dijamin minimal 1 Rare+.
+        PENTING: Cursed Traits (cursed == True / tier == 'Cursed') TIDAK PERNAH
+        masuk pool gacha normal."""
         n = weighted_choice([(1, 50), (2, 40), (3, 10)], rng)
-        n = min(3, max(1, n))  # spesifikasi: perk per hero 1-3, tidak boleh lebih
+        n = min(3, max(1, n))  # spesifikasi gacha awal: trait per hero 1-3
         if star >= 5:
             n = max(n, 2)
         perks = []
@@ -1116,27 +1680,36 @@ class HeroGenerator:
             tier = weighted_choice(list(TIER_WEIGHT.items()), rng)
             if tier == "Legendary" and used_leg:
                 tier = "Epic"
-            pool = [p for p, (t, _) in _PERKS.items() if t == tier and p not in perks]
+            pool = [
+                p for p, (t, _) in _TRAITS.items()
+                if t == tier and not _is_cursed_trait(p) and p not in perks
+            ]
             if not pool:
                 continue
-            perks.append(rng.choice(pool))
+            perks.append(_make_trait_tag(rng.choice(pool)))
             if tier == "Legendary":
                 used_leg = True
         if star >= 5 and len(perks) < 3 and not any(
-                _PERKS[p][0] in ("Rare", "Epic", "Legendary") for p in perks):
-            pool = [p for p, (t, _) in _PERKS.items() if t == "Rare"]
-            perks.append(rng.choice(pool))
+                _TRAITS[p][0] in ("Rare", "Epic", "Legendary") for p in perks):
+            pool = [
+                p for p, (t, _) in _TRAITS.items()
+                if t == "Rare" and not _is_cursed_trait(p) and p not in perks
+            ]
+            if pool:
+                perks.append(_make_trait_tag(rng.choice(pool)))
         if rare_bonus and len(perks) < 3 and rng.random() < 0.5:
-            pool = [p for p, (t, _) in _PERKS.items()
-                    if t in ("Rare", "Legendary") and p not in perks]
+            pool = [
+                p for p, (t, _) in _TRAITS.items()
+                if t in ("Rare", "Legendary") and not _is_cursed_trait(p) and p not in perks
+            ]
             if pool:
                 p = rng.choice(pool)
                 if p not in perks:
-                    if _PERKS[p][0] == "Legendary" and used_leg:
+                    if _TRAITS[p][0] == "Legendary" and used_leg:
                         pass
                     else:
-                        perks.append(p)
-                        if _PERKS[p][0] == "Legendary":
+                        perks.append(_make_trait_tag(p))
+                        if _TRAITS[p][0] == "Legendary":
                             used_leg = True
         return perks
 

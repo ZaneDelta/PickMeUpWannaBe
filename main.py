@@ -23,7 +23,9 @@ from generate_hero import (Hero, Equipment, Perk, Trait, Skill, HeroGenerator, G
                            weighted_choice, _safe_int, MAX_LEVEL, MAX_STAR,
                            CLASSES, EQUIP_SLOTS, roll_random_base_stats,
                            roll_random_growth_stats, roll_random_mp_regen,
-                           roll_random_skills)
+                           roll_random_skills,
+                           AbilityTag, _make_trait_tag, _make_skill_tag,
+                           _is_cursed_trait, _is_cursed_skill, get_overload_success_rate)
 
 VERSION = "2.3.0"
 GAME_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -61,9 +63,9 @@ def action_delay():
 
 # Data game yang kini disimpan di database SQLite:
 PROMO_TABLE = dbs.PROMO_TABLE       # biaya Star Promotion 1->7 (eksponensial)
-PERKS = dbs.load_perks()            # {nama: (tier, deskripsi)} dari tabel perks
-TRAITS = PERKS                      # alias resmi Traits (dahulu Perks)
-SKILLS = dbs.load_skills()          # {nama: {cls, tier, mp_cost, cd, kind, mult, description}}
+TRAITS = dbs.load_traits()          # {nama: (tier, deskripsi, cursed)} dari tabel traits
+PERKS = TRAITS                      # alias kompatibilitas mundur
+SKILLS = dbs.load_skills()          # {nama: {cls, tier, mp_cost, cd, kind, mult, description, cursed}}
 TIER_LABEL = dbs.TIER_LABEL
 STAR_MULTS = dbs.load_star_mults()  # {star: (base_mult, growth_mult)}
 
@@ -339,20 +341,27 @@ class BattleEngine:
         Targeting taunt ditangani AI musuh (enemy_act)."""
         if not hero.alive:
             return 0
-        # Guardian: hero NON-taunter yang punya perk ini dapat DEF +25%
+        # Guardian: hero NON-taunter yang punya trait ini dapat DEF +25%
         # selama ada ally lain yang sedang menarik perhatian (taunt aktif)
         dfn_eff = hero.dfn
         taunters = [t for t in self.living_heroes() if t.taunt_turns > 0]
         if taunters and hero is not taunters[0] and hero.has("Guardian"):
             dfn_eff = int(round(dfn_eff * 1.25))
         dmg = self.calc_damage(raw_atk, dfn_eff)
+        # Cursed Trait: Cracked Vessel (+15% damage tambahan dari semua serangan)
+        if hero.has("Cracked Vessel"):
+            dmg = max(1, int(round(dmg * 1.15)))
         hero.hp -= dmg
         hero.last_hit_by = source_name
         self.say("    >> %s kena %d dmg! (HP %d/%d)" % (hero.name, dmg, max(0, hero.hp), hero.max_hp))
         if hero.hp <= 0:
+            # Cursed Trait: Doomed Fate (menolak kebangkitan; langsung gugur permanen)
+            if hero.has("Doomed Fate"):
+                self.say("    [TRAIT] DOOMED FATE! %s menolak kebangkitan dan langsung gugur!" % hero.name)
+                self.handle_hero_death(hero, source_name)
             # PRIORITAS 1: Revive Feather di Tas Battle — mencegah kematian
             # (dipakai otomatis oleh AI di detik terakhir)
-            if "Revive Feather" in self.items:
+            elif "Revive Feather" in self.items:
                 self.items.remove("Revive Feather")
                 hero.hp = max(1, hero.max_hp * 2 // 5)
                 self.say("    [ITEM] REVIVE FEATHER terpakai otomatis!")
@@ -368,9 +377,10 @@ class BattleEngine:
         return dmg
 
     def handle_hero_death(self, hero, source):
-        """Phoenix: sekali per battle revive 50% HP. Kalau tidak dipakai /
-        tidak dimiliki: PERMADEATH — hero gugur, SEMUA equipment hancur."""
-        if hero.has("Phoenix") and not hero.used_phoenix:
+        """Phoenix: sekali per battle revive 50% HP (kecuali ber-trait Doomed Fate).
+        Kalau tidak dipakai / tidak dimiliki: PERMADEATH — hero gugur, SEMUA equipment hancur.
+        Unstable Core: jiwa meledak dan melukai seluruh rekan party yang hidup 25% Max HP."""
+        if not hero.has("Doomed Fate") and hero.has("Phoenix") and not hero.used_phoenix:
             hero.used_phoenix = True
             hero.hp = max(1, hero.max_hp // 2)
             self.say("    *** TRAIT PHOENIX! %s bangkit dari kematian (HP 50%%) ***" % hero.name)
@@ -385,6 +395,18 @@ class BattleEngine:
         else:
             self.say("    XXX Semua equipment %s hancur." % hero.name)
 
+        # Cursed Trait: Unstable Core (ledakan jiwa saat gugur mengenai seluruh rekan hidup)
+        if hero.has("Unstable Core"):
+            self.say("    [TRAIT] UNSTABLE CORE! Jiwa %s meledak dahsyat saat gugur!" % hero.name)
+            allies = [a for a in self.living_heroes() if a is not hero and a.alive]
+            for ally in allies:
+                burst_dmg = max(1, int(ally.max_hp * 0.25))
+                ally.hp -= burst_dmg
+                self.say("    >> Ledakan jiwa mengenai %s! -%d HP (HP %d/%d)" % (
+                    ally.name, burst_dmg, max(0, ally.hp), ally.max_hp))
+                if ally.hp <= 0:
+                    self.handle_hero_death(ally, "%s (Unstable Core)" % hero.name)
+
     def apply_damage_to_enemy(self, enemy, dmg, source_name):
         enemy.hp -= dmg
         self.say("    >> %s -> %s: %d dmg (HP %d/%d)" % (
@@ -394,6 +416,34 @@ class BattleEngine:
             self.say("    ### %s DIKALAHKAN! ###" % enemy.name)
 
     # ------------------------- aksi hero -------------------------
+    def _check_bloodlust_masochist(self, h):
+        """Cursed Trait: Bloodlust Masochist (kehilangan 8% Max HP pada tiap aksi serangan)."""
+        if h.has("Bloodlust Masochist") and h.alive:
+            self_cost = max(1, int(h.max_hp * 0.08))
+            h.hp = max(1, h.hp - self_cost)
+            self.say("    [TRAIT] Bloodlust Masochist: %s menyayat diri (-%d HP, HP %d/%d)" % (
+                h.name, self_cost, h.hp, h.max_hp))
+
+    def deduct_skill_mp(self, h, eff_cost):
+        """Potong MP untuk skill; jika ber-trait Mana Parasite dan MP sendiri kurang,
+        sedot paksa sisa MP dari rekan satu party secara acak."""
+        if eff_cost <= 0:
+            return
+        if h.has("Mana Parasite") and h.mana < eff_cost:
+            deficit = eff_cost - h.mana
+            h.mana = 0.0
+            allies = [a for a in self.living_heroes() if a is not h and a.mana > 0]
+            while deficit > 0 and allies:
+                donor = random.choice(allies)
+                take = min(deficit, donor.mana)
+                donor.mana = round(donor.mana - take, 1)
+                deficit = round(deficit - take, 1)
+                self.say("    [TRAIT] Mana Parasite: %s menyedot %d MP dari %s!" % (
+                    h.name, int(round(take)), donor.name))
+                allies = [a for a in self.living_heroes() if a is not h and a.mana > 0]
+        else:
+            h.mana = max(0.0, round(h.mana - eff_cost, 1))
+
     def hero_act(self, h):
         """AI Hero berbasis skill unik yang dimiliki hero (h.skills),
         tidak lagi dikunci oleh class. MP kurang / cooldown -> fallback attack."""
@@ -405,9 +455,16 @@ class BattleEngine:
             h.stun_turns -= 1
             self.say("  [R%d] %s STUN, giliran dilewati." % (self.round, h.name))
             return
-        # Ketidakstabilan Mental (Hero Synthesis): jika sanity < 40.0,
-        # peluang 20% jiwa di dalam tubuh hero mengamuk / mengambil alih
-        if getattr(h, "sanity", 100.0) < 40.0 and random.random() < 0.20:
+        # Cursed Trait: Severed Nerves (peluang 20% lumpuh / melewatkan giliran)
+        if h.has("Severed Nerves") and random.random() < 0.20:
+            self.say("  [R%d] %s lumpuh oleh Severed Nerves! Giliran dilewati." % (self.round, h.name))
+            return
+        # Ketidakstabilan Mental / Cursed Trait: Schizophrenic Ego
+        is_schizo = h.has("Schizophrenic Ego")
+        instab_rate = 0.35 if is_schizo else (0.20 if getattr(h, "sanity", 100.0) < 40.0 else 0.0)
+        if instab_rate > 0 and random.random() < instab_rate:
+            if is_schizo and getattr(h, "sanity", 100.0) >= 40.0:
+                self.say("  [!] Schizophrenic Ego memicu gejolak mental pada %s!" % h.name)
             self._trigger_mental_instability(h, enemies)
             return
         # AI ITEM: sebelum aksi lain, hero "berpikir" apakah item bawaan
@@ -432,6 +489,7 @@ class BattleEngine:
         self.say("  [R%d] %s [SOUL BERSERK] menerjang %s secara brutal!%s" % (
             self.round, h.name, target.name, note))
         self.apply_damage_to_enemy(target, dmg, h.name)
+        self._check_bloodlust_masochist(h)
         lifesteal_pct = (0.20 if h.has("Vampiric") else 0.0) + (0.10 if h.has("Bloodthirst") else 0.0)
         if lifesteal_pct > 0 and h.alive:
             heal = max(1, int(dmg * lifesteal_pct))
@@ -439,18 +497,24 @@ class BattleEngine:
             self.say("    ~~ Lifesteal: %s pulih %d HP" % (h.name, heal))
 
     def _trigger_mental_instability(self, h, enemies):
-        """Efek sanity kritis (< 40.0): 50% Soul Berserk / 50% Memory Echo."""
+        """Efek sanity kritis (< 40.0) atau Schizophrenic Ego: 50% Soul Berserk / 50% Memory Echo."""
         if random.random() < 0.50:
             self.say("  [!] Jiwa di dalam tubuh %s mengamuk tak terkendali!" % h.name)
             self._soul_berserk_attack(h, enemies)
             return
         self.say("  [!] Fragmen ingatan tumbal mengambil alih tubuh %s!" % h.name)
-        off_kinds = ("aoe_stun", "aoe_pierce", "aoe_slow", "pierce", "drain", "stun", "single")
+        off_kinds = (
+            "aoe_stun", "aoe_pierce", "aoe_slow", "pierce", "drain", "stun", "single",
+            "cursed_self_dmg_pierce", "cursed_aoe_ally_debuff", "cursed_betrayal_hit",
+            "cursed_mp_leech_party", "cursed_aoe_sanity_drain", "cursed_zero_def_burst",
+            "cursed_blind_multihit", "cursed_all_mp_pierce", "cursed_gamble_strike",
+            "cursed_all_field_decay", "cursed_recoil_stun",
+        )
         off_cands = []
         for sk_name in (getattr(h, "skills", None) or []):
-            info = SKILLS.get(sk_name)
+            info = SKILLS.get(str(sk_name))
             if info and info.get("kind") in off_kinds:
-                off_cands.append((sk_name, info))
+                off_cands.append((str(sk_name), info))
         if not off_cands:
             # Fallback ke Soul Berserk bila hero tidak punya skill ofensif
             self._soul_berserk_attack(h, enemies)
@@ -462,28 +526,30 @@ class BattleEngine:
             mult *= 1.30
         label = "%s (Memory Echo)" % sk_name.upper()
         # Eksekusi tanpa menguras MP (h.mana tetap utuh)
-        if kind.startswith("aoe"):
+        if kind.startswith("aoe") or kind in ("cursed_aoe_ally_debuff", "cursed_aoe_sanity_drain"):
             tier_s = info.get("tier", "Common")
             stun_c = 0.0
             if kind == "aoe_stun":
                 stun_c = 0.25 if tier_s == "Legendary" else (0.18 if tier_s == "Epic" else 0.12)
             self.cast_aoe(h, mult, label, stun_chance=stun_c,
                           slow=(kind == "aoe_slow"), ignore_def=(kind == "aoe_pierce"))
+            self._check_bloodlust_masochist(h)
             return
         target = random.choice(enemies)
         base_atk, note = self.atk_with_perks(h, target)
-        eff_dfn = 0 if kind == "pierce" else target.dfn
+        eff_dfn = 0 if kind in ("pierce", "cursed_self_dmg_pierce", "cursed_all_mp_pierce") else target.dfn
         dmg = self.calc_damage(int(base_atk * mult), eff_dfn)
-        extra = " (ignore DEF)" if kind == "pierce" else ""
+        extra = " (ignore DEF)" if kind in ("pierce", "cursed_self_dmg_pierce", "cursed_all_mp_pierce") else ""
         self.say("  [R%d] %s: %s%s ke %s%s" % (
             self.round, h.name, label, extra, target.name, note))
-        if kind == "stun":
+        if kind in ("stun", "cursed_recoil_stun"):
             tier_s = info.get("tier", "Common")
-            stun_rate = 0.35 if tier_s in ("Epic", "Legendary") else (0.25 if tier_s == "Rare" else 0.20)
+            stun_rate = 0.35 if tier_s in ("Epic", "Legendary", "Cursed") else (0.25 if tier_s == "Rare" else 0.20)
             if random.random() < stun_rate:
                 target.stun_turns = 1
                 self.say("    !! %s terkena STUN 1 ronde!" % target.name)
         self.apply_damage_to_enemy(target, dmg, h.name)
+        self._check_bloodlust_masochist(h)
         if kind == "drain" and h.alive:
             drain_hp = max(1, int(dmg * 0.40))
             before = h.hp
@@ -548,34 +614,42 @@ class BattleEngine:
 
     def use_hero_skill(self, h, enemies):
         """Evaluasi dan jalankan skill dari h.skills yang siap (off-cooldown & MP cukup).
+        Mendukung penuh 240 skills normal dan 15 CURSED SKILLS baru.
         Urutan prioritas AI cerdas:
-          1. Heal / Cleanse darurat (Mass Heal bila >=2 ally luka, Cleanse/Heal bila ally luka/stun)
-          2. Taunt (khusus skill class Tanker bila belum ada taunt aktif pada diri sendiri)
-          3. Buff party / Mana gift (War Cry / Attack / Guard / Speed / Mana Chorus)
-          4. Skill ofensif / AoE / CC terkuat yang siap dipakai
+          1. Heal / Cleanse darurat (Mass Heal, Cleanse, Single Heal, Corrupted Heal, Parasitic Leech)
+          2. Taunt (Tanker taunt & Cursed Provocation)
+          3. Buff party / Mana gift (War Cry / Guard / Speed / Mana Chorus)
+          4. Skill ofensif / AoE / CC / Cursed burst terkuat
         Return True bila skill digunakan, False bila tidak ada yang dipakai."""
         skills = getattr(h, "skills", None) or []
         if not skills:
             return False
+        allies = self.living_heroes()
         ready = []
         for sk_name in skills:
-            info = SKILLS.get(sk_name)
+            info = SKILLS.get(str(sk_name))
             if not info:
                 continue
             eff_cost = h.skill_mp_cost(info["mp_cost"]) if hasattr(h, "skill_mp_cost") else info["mp_cost"]
-            if h.skill_cd.get(sk_name, 0) <= 0 and h.mana >= eff_cost:
-                ready.append((sk_name, info, eff_cost))
+            can_afford = False
+            if h.mana >= eff_cost:
+                can_afford = True
+            elif h.has("Mana Parasite"):
+                other_mp = sum(a.mana for a in allies if a is not h)
+                if h.mana + other_mp >= eff_cost:
+                    can_afford = True
+            if h.skill_cd.get(str(sk_name), 0) <= 0 and can_afford:
+                ready.append((str(sk_name), info, eff_cost))
         if not ready:
             return False
 
-        allies = self.living_heroes()
         wounded = [a for a in allies if a.hp < a.max_hp * 0.60]
         stunned_allies = [a for a in allies if a.stun_turns > 0]
 
-        # 1) Mass Heal, Cleanse Heal, & Single Heal
+        # 1) Mass Heal, Cleanse Heal, Single Heal, & Cursed Heals
         for sk_name, info, eff_cost in ready:
             if info["kind"] == "mass_heal" and len(wounded) >= 2:
-                h.mana -= eff_cost
+                self.deduct_skill_mp(h, eff_cost)
                 h.skill_cd[sk_name] = info["cd"]
                 amount = int(info["mult"] * h.atk + 15)
                 self.say("  [R%d] %s: %s (%d HP semua ally)" % (
@@ -585,7 +659,7 @@ class BattleEngine:
                 return True
         for sk_name, info, eff_cost in ready:
             if info["kind"] == "cleanse_heal" and (wounded or stunned_allies):
-                h.mana -= eff_cost
+                self.deduct_skill_mp(h, eff_cost)
                 h.skill_cd[sk_name] = info["cd"]
                 cands = stunned_allies if stunned_allies else wounded
                 target = min(cands, key=lambda a: a.hp / a.max_hp)
@@ -597,7 +671,7 @@ class BattleEngine:
                 return True
         for sk_name, info, eff_cost in ready:
             if info["kind"] == "heal" and wounded:
-                h.mana -= eff_cost
+                self.deduct_skill_mp(h, eff_cost)
                 h.skill_cd[sk_name] = info["cd"]
                 target = min(wounded, key=lambda a: a.hp / a.max_hp)
                 amount = int(info["mult"] * h.atk + 25)
@@ -605,17 +679,57 @@ class BattleEngine:
                     self.round, h.name, sk_name.upper(), target.name))
                 self.heal_unit(h, target, amount)
                 return True
+        for sk_name, info, eff_cost in ready:
+            if info["kind"] == "cursed_poison_heal" and wounded:
+                self.deduct_skill_mp(h, eff_cost)
+                h.skill_cd[sk_name] = info["cd"]
+                target = min(wounded, key=lambda a: a.hp / a.max_hp)
+                heal_amt = int(target.max_hp * 0.45)
+                target.hp = min(target.max_hp, target.hp + heal_amt)
+                target.buff_atk -= 20
+                burn_self = max(1, int(h.max_hp * 0.20))
+                h.hp = max(1, h.hp - burn_self)
+                self.say("  [R%d] %s: [CURSED] CORRUPTED HEAL -> %s (+%d HP, ATK -20%%; %s bakar %d HP)!" % (
+                    self.round, h.name, target.name, heal_amt, h.name, burn_self))
+                return True
+        for sk_name, info, eff_cost in ready:
+            if info["kind"] == "cursed_ally_hp_steal" and h.hp < h.max_hp * 0.70:
+                self.deduct_skill_mp(h, eff_cost)
+                h.skill_cd[sk_name] = info["cd"]
+                other_allies = [a for a in allies if a is not h and a.alive]
+                if other_allies:
+                    target_ally = max(other_allies, key=lambda a: a.hp)
+                    stolen = max(1, int(target_ally.max_hp * 0.15))
+                    target_ally.hp = max(1, target_ally.hp - stolen)
+                    h.hp = min(h.max_hp, h.hp + stolen)
+                    self.say("  [R%d] %s: [CURSED] PARASITIC LEECH mencuri %d HP dari %s!" % (
+                        self.round, h.name, stolen, target_ally.name))
+                else:
+                    self_loss = max(1, int(h.max_hp * 0.10))
+                    h.hp = max(1, h.hp - self_loss)
+                    self.say("  [R%d] %s: [CURSED] PARASITIC LEECH tanpa rekan, melukai diri (-%d HP)!" % (
+                        self.round, h.name, self_loss))
+                return True
 
-        # 2) Taunt (hanya dimiliki pool class Tanker)
+        # 2) Taunt (Tanker Taunt & Cursed Provocation)
         for sk_name, info, eff_cost in ready:
             if info["kind"] == "taunt" and h.taunt_turns <= 0:
-                h.mana -= eff_cost
+                self.deduct_skill_mp(h, eff_cost)
                 h.skill_cd[sk_name] = info["cd"]
                 h.taunt_turns = 2
                 def_bonus = int(info["mult"]) if info["mult"] >= 10 else 30
                 h.buff_def = max(h.buff_def, def_bonus)
                 self.say("  [R%d] %s: %s! (musuh dipaksa menarget, DEF +%d%%)" % (
                     self.round, h.name, sk_name.upper(), def_bonus))
+                return True
+        for sk_name, info, eff_cost in ready:
+            if info["kind"] == "cursed_suicide_taunt" and h.taunt_turns <= 0:
+                self.deduct_skill_mp(h, eff_cost)
+                h.skill_cd[sk_name] = info["cd"]
+                h.taunt_turns = 2
+                h.buff_def -= 35
+                self.say("  [R%d] %s: [CURSED] CURSED PROVOCATION! (musuh terprovokasi 2 ronde, DEF -35%%)" % (
+                    self.round, h.name))
                 return True
 
         # 3) Buff party & Mana Gift
@@ -625,7 +739,7 @@ class BattleEngine:
         low_mp_allies = [a for a in allies if a.mana < a.max_mp * 0.65]
         for sk_name, info, eff_cost in ready:
             if info["kind"] == "buff_all" and (not atk_active or not spd_active):
-                h.mana -= eff_cost
+                self.deduct_skill_mp(h, eff_cost)
                 h.skill_cd[sk_name] = info["cd"]
                 pct = int(info["mult"])
                 self.say("  [R%d] %s: %s! ATK +%d%% & SPD +20%% party (3 ronde)" % (
@@ -635,7 +749,7 @@ class BattleEngine:
                     a.buff_spd = max(a.buff_spd, 20)
                 return True
             if info["kind"] == "buff_atk" and not atk_active:
-                h.mana -= eff_cost
+                self.deduct_skill_mp(h, eff_cost)
                 h.skill_cd[sk_name] = info["cd"]
                 pct = int(info["mult"])
                 self.say("  [R%d] %s: %s! ATK party +%d%% (3 ronde)" % (
@@ -644,7 +758,7 @@ class BattleEngine:
                     a.buff_atk = max(a.buff_atk, pct)
                 return True
             if info["kind"] == "buff_def" and not def_active:
-                h.mana -= eff_cost
+                self.deduct_skill_mp(h, eff_cost)
                 h.skill_cd[sk_name] = info["cd"]
                 pct = int(info["mult"])
                 self.say("  [R%d] %s: %s! DEF party +%d%% (3 ronde)" % (
@@ -653,7 +767,7 @@ class BattleEngine:
                     a.buff_def = max(a.buff_def, pct)
                 return True
             if info["kind"] == "buff_spd" and not spd_active:
-                h.mana -= eff_cost
+                self.deduct_skill_mp(h, eff_cost)
                 h.skill_cd[sk_name] = info["cd"]
                 pct = int(info["mult"])
                 self.say("  [R%d] %s: %s! SPD party +%d%% (3 ronde)" % (
@@ -662,7 +776,7 @@ class BattleEngine:
                     a.buff_spd = max(a.buff_spd, pct)
                 return True
             if info["kind"] == "mana_gift" and low_mp_allies:
-                h.mana -= eff_cost
+                self.deduct_skill_mp(h, eff_cost)
                 h.skill_cd[sk_name] = info["cd"]
                 mp_amt = int(info["mult"])
                 self.say("  [R%d] %s: %s! (+%d MP ke seluruh party)" % (
@@ -671,8 +785,14 @@ class BattleEngine:
                     a.mana = min(a.max_mp, a.mana + mp_amt)
                 return True
 
-        # 4) Skill ofensif (urutkan dari dampak / MP cost terbesar)
-        off_kinds = ("aoe_stun", "aoe_pierce", "aoe_slow", "pierce", "drain", "stun", "single")
+        # 4) Skill ofensif & Cursed Damage Skills
+        off_kinds = (
+            "aoe_stun", "aoe_pierce", "aoe_slow", "pierce", "drain", "stun", "single",
+            "cursed_self_dmg_pierce", "cursed_aoe_ally_debuff", "cursed_betrayal_hit",
+            "cursed_mp_leech_party", "cursed_aoe_sanity_drain", "cursed_zero_def_burst",
+            "cursed_blind_multihit", "cursed_all_mp_pierce", "cursed_gamble_strike",
+            "cursed_skip_self_harm", "cursed_all_field_decay", "cursed_recoil_stun",
+        )
         off_ready = [(s, inf, c) for s, inf, c in ready if inf["kind"] in off_kinds]
         if not off_ready:
             return False
@@ -680,18 +800,194 @@ class BattleEngine:
         sk_name, info, eff_cost = off_ready[0]
         kind = info["kind"]
         mult = info["mult"]
-        # Trait Overcharge: saat MP > 70% sebelum cast, damage skill +30%
         if h.has("Overcharge") and h.max_mp > 0 and h.mana > h.max_mp * 0.70:
             mult *= 1.30
-        cost = eff_cost
         label = sk_name.upper()
 
-        # AoE skills (mendukung trait Double Cast untuk semua hero)
+        # --- A. Cursed Unique Executions ---
+        if kind == "cursed_self_dmg_pierce":
+            target = min(enemies, key=lambda e: (e.hp, -e.atk))
+            self.deduct_skill_mp(h, eff_cost)
+            h.skill_cd[sk_name] = info["cd"]
+            base_atk, note = self.atk_with_perks(h, target)
+            dmg = self.calc_damage(int(base_atk * mult), 0)
+            recoil = max(1, int(h.max_hp * 0.25))
+            h.hp = max(1, h.hp - recoil)
+            self.say("  [R%d] %s: [CURSED] SOUL HEMORRHAGE (ignore DEF) ke %s%s (-%d HP pemakai)!" % (
+                self.round, h.name, target.name, note, recoil))
+            self.apply_damage_to_enemy(target, dmg, h.name)
+            self._check_bloodlust_masochist(h)
+            return True
+
+        if kind == "cursed_aoe_ally_debuff":
+            self.deduct_skill_mp(h, eff_cost)
+            h.skill_cd[sk_name] = info["cd"]
+            self.say("  [R%d] %s: [CURSED] DISCORDANT WAIL! AoE semua musuh & DEF party -25%% (2 ronde)!" % (
+                self.round, h.name))
+            for a in allies:
+                a.buff_def -= 25
+            for e in self.living_enemies():
+                dmg = self.calc_damage(int(h.atk * mult), e.dfn)
+                self.apply_damage_to_enemy(e, dmg, "%s [Discordant Wail]" % h.name)
+            self._check_bloodlust_masochist(h)
+            return True
+
+        if kind == "cursed_betrayal_hit":
+            self.deduct_skill_mp(h, eff_cost)
+            h.skill_cd[sk_name] = info["cd"]
+            if random.random() < 0.40:
+                other_allies = [a for a in allies if a is not h and a.alive]
+                target_ally = random.choice(other_allies) if other_allies else h
+                dmg = self.calc_damage(int(h.atk * mult), target_ally.dfn)
+                self.say("  [R%d] %s: [CURSED] FRENZIED BETRAYAL mengamuk dan MENGHANTAM REKAN %s!" % (
+                    self.round, h.name, target_ally.name))
+                self.apply_damage_to_hero(target_ally, dmg, h.name)
+            else:
+                target = min(enemies, key=lambda e: (e.hp, -e.atk))
+                base_atk, note = self.atk_with_perks(h, target)
+                dmg = self.calc_damage(int(base_atk * mult), target.dfn)
+                self.say("  [R%d] %s: [CURSED] FRENZIED BETRAYAL menghantam %s%s!" % (
+                    self.round, h.name, target.name, note))
+                self.apply_damage_to_enemy(target, dmg, h.name)
+            self._check_bloodlust_masochist(h)
+            return True
+
+        if kind == "cursed_mp_leech_party":
+            target = min(enemies, key=lambda e: (e.hp, -e.atk))
+            self.deduct_skill_mp(h, eff_cost)
+            h.skill_cd[sk_name] = info["cd"]
+            for a in allies:
+                if a is not h:
+                    a.mana = max(0.0, round(a.mana * 0.70, 1))
+            heal = int(h.max_hp * 0.25)
+            h.hp = min(h.max_hp, h.hp + heal)
+            dmg = self.calc_damage(int(h.atk * mult), target.dfn)
+            self.say("  [R%d] %s: [CURSED] ABYSSAL GLUTTONY sedot 30%% MP rekan, pulih %d HP, serang %s!" % (
+                self.round, h.name, heal, target.name))
+            self.apply_damage_to_enemy(target, dmg, h.name)
+            self._check_bloodlust_masochist(h)
+            return True
+
+        if kind == "cursed_aoe_sanity_drain":
+            self.deduct_skill_mp(h, eff_cost)
+            h.skill_cd[sk_name] = info["cd"]
+            h.sanity = max(0.0, round(float(h.sanity) - 10.0, 1))
+            h.stun_turns = 1
+            self.say("  [R%d] %s: [CURSED] SHATTERED MIND BLAST! AoE dahsyat (Sanity -10.0, pemakai STUN)!" % (
+                self.round, h.name))
+            for e in self.living_enemies():
+                dmg = self.calc_damage(int(h.atk * mult), e.dfn)
+                self.apply_damage_to_enemy(e, dmg, "%s [Shattered Mind Blast]" % h.name)
+            self._check_bloodlust_masochist(h)
+            return True
+
+        if kind == "cursed_zero_def_burst":
+            target = min(enemies, key=lambda e: (e.hp, -e.atk))
+            self.deduct_skill_mp(h, eff_cost)
+            h.skill_cd[sk_name] = info["cd"]
+            h.zero_def_turns = 2
+            h.buff_atk = max(h.buff_atk, 80)
+            base_atk, note = self.atk_with_perks(h, target)
+            dmg = self.calc_damage(int(base_atk * mult), target.dfn)
+            self.say("  [R%d] %s: [CURSED] FLESH SACRIFICE! DEF jadi 0, ATK +80%%, hantam %s%s!" % (
+                self.round, h.name, target.name, note))
+            self.apply_damage_to_enemy(target, dmg, h.name)
+            self._check_bloodlust_masochist(h)
+            return True
+
+        if kind == "cursed_blind_multihit":
+            self.deduct_skill_mp(h, eff_cost)
+            h.skill_cd[sk_name] = info["cd"]
+            self.say("  [R%d] %s: [CURSED] BLIND RAMPAGE mengamuk 3 kali tebasan!" % (self.round, h.name))
+            for i in range(3):
+                cur_enemies = self.living_enemies()
+                if not cur_enemies:
+                    break
+                target = random.choice(cur_enemies)
+                swing_cost = max(1, int(h.max_hp * 0.05))
+                h.hp = max(1, h.hp - swing_cost)
+                if random.random() < 0.50:
+                    self.say("    [Hit %d] Tebasan ke %s MELESET! (pemakai -%d HP)" % (i+1, target.name, swing_cost))
+                else:
+                    dmg = self.calc_damage(int(h.atk * mult), target.dfn)
+                    self.say("    [Hit %d] Tebasan mengenai %s! (pemakai -%d HP)" % (i+1, target.name, swing_cost))
+                    self.apply_damage_to_enemy(target, dmg, h.name)
+            self._check_bloodlust_masochist(h)
+            return True
+
+        if kind == "cursed_all_mp_pierce":
+            target = min(enemies, key=lambda e: (e.hp, -e.atk))
+            h.mana = 0.0
+            h.skill_cd[sk_name] = info["cd"]
+            base_atk, note = self.atk_with_perks(h, target)
+            dmg = self.calc_damage(int(base_atk * mult), 0)
+            self.say("  [R%d] %s: [CURSED] MANA BURNOUT menguras seluruh MP tembus DEF %s%s!" % (
+                self.round, h.name, target.name, note))
+            self.apply_damage_to_enemy(target, dmg, h.name)
+            self._check_bloodlust_masochist(h)
+            return True
+
+        if kind == "cursed_gamble_strike":
+            target = min(enemies, key=lambda e: (e.hp, -e.atk))
+            self.deduct_skill_mp(h, eff_cost)
+            h.skill_cd[sk_name] = info["cd"]
+            if random.random() < 0.50:
+                base_atk, note = self.atk_with_perks(h, target)
+                dmg = self.calc_damage(int(base_atk * mult), target.dfn)
+                self.say("  [R%d] %s: [CURSED] DEATH WISH GAMBLE SUKSES! Tebasan 300%% ATK ke %s%s!" % (
+                    self.round, h.name, target.name, note))
+                self.apply_damage_to_enemy(target, dmg, h.name)
+            else:
+                h.hp = 1
+                self.say("  [R%d] %s: [CURSED] DEATH WISH GAMBLE GAGAL! 0 damage, HP pemakai sisa 1!" % (
+                    self.round, h.name))
+            self._check_bloodlust_masochist(h)
+            return True
+
+        if kind == "cursed_skip_self_harm":
+            self.deduct_skill_mp(h, eff_cost)
+            h.skill_cd[sk_name] = info["cd"]
+            self_dmg = max(1, int(h.max_hp * 0.08))
+            h.hp = max(1, h.hp - self_dmg)
+            self.say("  [R%d] %s: [CURSED] HOLLOW ECHO... Jiwa gagal merespons, giliran dilewati & -%d HP!" % (
+                self.round, h.name, self_dmg))
+            return True
+
+        if kind == "cursed_all_field_decay":
+            self.deduct_skill_mp(h, eff_cost)
+            h.skill_cd[sk_name] = info["cd"]
+            self.say("  [R%d] %s: [CURSED] ROTTING MIASMA mengikis 10%% HP semua unit di medan tempur!" % (
+                self.round, h.name))
+            for u in list(self.living_enemies()) + list(self.living_heroes()):
+                drain = max(1, int(u.hp * 0.10))
+                u.hp = max(1, u.hp - drain)
+            self._check_bloodlust_masochist(h)
+            return True
+
+        if kind == "cursed_recoil_stun":
+            target = min(enemies, key=lambda e: (e.hp, -e.atk))
+            self.deduct_skill_mp(h, eff_cost)
+            h.skill_cd[sk_name] = info["cd"]
+            base_atk, note = self.atk_with_perks(h, target)
+            dmg = self.calc_damage(int(base_atk * mult), target.dfn)
+            recoil = max(1, dmg // 2)
+            h.hp = max(1, h.hp - recoil)
+            self.say("  [R%d] %s: [CURSED] PHANTOM PAIN STRIKE ke %s%s (-%d HP recoil)!" % (
+                self.round, h.name, target.name, note, recoil))
+            if random.random() < 0.40:
+                target.stun_turns = 1
+                self.say("    !! %s terkena STUN 1 ronde!" % target.name)
+            self.apply_damage_to_enemy(target, dmg, h.name)
+            self._check_bloodlust_masochist(h)
+            return True
+
+        # --- B. Normal AoE skills ---
         if kind.startswith("aoe"):
+            cost = eff_cost
             if h.has("Double Cast") and random.random() < 0.15:
                 cost = 0
                 label += " (Double Cast: gratis!)"
-            h.mana -= cost
+            self.deduct_skill_mp(h, cost)
             h.skill_cd[sk_name] = info["cd"]
             tier_s = info.get("tier", "Common")
             stun_c = 0.0
@@ -700,10 +996,11 @@ class BattleEngine:
             is_slow = (kind == "aoe_slow")
             ignore_def = (kind == "aoe_pierce")
             self.cast_aoe(h, mult, label, stun_chance=stun_c, slow=is_slow, ignore_def=ignore_def)
+            self._check_bloodlust_masochist(h)
             return True
 
-        # Single-target offensive skills
-        h.mana -= cost
+        # --- C. Normal Single-target offensive skills ---
+        self.deduct_skill_mp(h, eff_cost)
         h.skill_cd[sk_name] = info["cd"]
         target = min(enemies, key=lambda e: (e.hp, -e.atk))
         base_atk, note = self.atk_with_perks(h, target)
@@ -719,6 +1016,7 @@ class BattleEngine:
                 target.stun_turns = 1
                 self.say("    !! %s terkena STUN 1 ronde!" % target.name)
         self.apply_damage_to_enemy(target, dmg, h.name)
+        self._check_bloodlust_masochist(h)
         if kind == "drain" and h.alive:
             drain_hp = max(1, int(dmg * 0.40))
             before = h.hp
@@ -762,6 +1060,7 @@ class BattleEngine:
         dmg = self.calc_damage(a, target.dfn)
         self.say("  [R%d] %s menyerang %s%s" % (self.round, h.name, target.name, note))
         self.apply_damage_to_enemy(target, dmg, h.name)
+        self._check_bloodlust_masochist(h)
         # Vampiric (20%) & Bloodthirst (10%): lifesteal dari serangan fisik
         lifesteal_pct = (0.20 if h.has("Vampiric") else 0.0) + (0.10 if h.has("Bloodthirst") else 0.0)
         if lifesteal_pct > 0 and h.alive:
@@ -826,16 +1125,21 @@ class BattleEngine:
 
     # ---------------------------- ronde ----------------------------
     def run_round(self):
-        """Satu ronde penuh: sort SPD desc (tie: party dulu) -> aksi ->
-        cek kematian -> regen MP -> buff tick-down."""
+        """Satu ronde penuh: update aura -> sort SPD desc (tie: party dulu) -> aksi ->
+        cek kematian -> regen MP / Leaking Soul -> buff/debuff tick-down."""
         self.round += 1
         self.say("")
         self.say("======== RONDE %d ========" % self.round)
+
+        # Cursed Trait: Cursed Aura (aktif jika ada rekan party lain ber-trait Cursed Aura)
+        living_party = self.living_heroes()
+        for h in living_party:
+            h.cursed_aura_active = any(other.has("Cursed Aura") for other in living_party if other is not h)
+
         # Urutan aksi: SPD menurun. Tie-break: hero sebelum musuh, lalu
         # urutan list (stabil via index) — penting untuk determinisme.
         units = [("hero", i, h) for i, h in enumerate(self.heroes) if h.alive]
         units += [("enemy", i, e) for i, e in enumerate(self.enemies) if e.alive]
-        # SPD float tanpa rounding agar urutan adil; tie: party dulu
         units.sort(key=lambda u: (-u[2].spd if u[0] == "hero" else -(u[2].eff_spd + 0.01),
                                   0 if u[0] == "hero" else 1, u[1]))
         for kind, _, unit in units:
@@ -856,7 +1160,11 @@ class BattleEngine:
         if not self.result:
             # End of round: regen MP, trait HP regen, tick buffs/cooldowns
             for h in self.living_heroes():
-                h.mana = min(h.max_mp, h.mana + h.mp_regen)
+                # Cursed Trait: Leaking Soul (tidak ada regen MP, hilang 5 MP per ronde)
+                if h.has("Leaking Soul"):
+                    h.mana = max(0.0, round(h.mana - 5.0, 1))
+                else:
+                    h.mana = min(h.max_mp, h.mana + h.mp_regen)
                 regen_pct = (0.05 if h.has("Vitality Aura") else 0.0) + \
                             (0.08 if h.has("Immortal Vessel") else 0.0)
                 if regen_pct > 0 and h.hp < h.max_hp:
@@ -865,9 +1173,26 @@ class BattleEngine:
                     h.taunt_turns -= 1
                     if h.taunt_turns == 0:
                         h.buff_def = 0  # buff taunt hilang bersama taunt
-                h.buff_atk = max(0, h.buff_atk - 10) if h.buff_atk > 0 else 0
-                h.buff_def = max(0, h.buff_def - 10) if h.buff_def > 0 and h.taunt_turns <= 0 else h.buff_def
-                h.buff_spd = max(0, h.buff_spd - 10) if h.buff_spd > 0 else 0
+                # Tick zero_def_turns (Flesh Sacrifice)
+                if getattr(h, "zero_def_turns", 0) > 0:
+                    h.zero_def_turns -= 1
+                # Tick buff & debuff battle (positif berkurang ke 0, negatif bertambah ke 0)
+                if h.buff_atk > 0:
+                    h.buff_atk = max(0, h.buff_atk - 10)
+                elif h.buff_atk < 0:
+                    h.buff_atk = min(0, h.buff_atk + 10)
+
+                if h.taunt_turns <= 0:
+                    if h.buff_def > 0:
+                        h.buff_def = max(0, h.buff_def - 10)
+                    elif h.buff_def < 0:
+                        h.buff_def = min(0, h.buff_def + 10)
+
+                if h.buff_spd > 0:
+                    h.buff_spd = max(0, h.buff_spd - 10)
+                elif h.buff_spd < 0:
+                    h.buff_spd = min(0, h.buff_spd + 10)
+
                 for k in list(h.skill_cd):
                     h.skill_cd[k] = max(0, h.skill_cd[k] - 1)
             for e in self.living_enemies():
@@ -876,8 +1201,6 @@ class BattleEngine:
                 if e.slow_turns > 0:
                     e.slow_turns -= 1
             self.show_field()
-            # Jeda GANTI RONDE tetap berjalan di semua mode (readability
-            # antar ronde); hanya jeda antar aksi unit yang bisa dimatikan.
             sleep(BATTLE_DELAY)
 
     def run(self):
@@ -1161,40 +1484,60 @@ def _to_float(v, default=0.0):
 
 def ensure_hero_fields(hd):
     """Migrasi 1 hero: field baru yang tidak ada di save lama diisi default
-    (growth_multiplier, perks, skills, base_stats, growth_stats, mp_regen,
-    equipment, alive, blueprints, dll)."""
+    (growth_multiplier, traits, perks, skills, base_stats, growth_stats, mp_regen,
+    equipment, alive, blueprints, sanity, ego, synth_count, absorbed_souls, dll).
+    Mendukung migrasi mulus dua arah 'perks' <-> 'traits', normalisasi boolean 'cursed',
+    dan menjaga stat yang anjlok akibat kegagalan Soul Overload tetap tersimpan
+    tanpa terdorong naik ke minimum class."""
     name = str(hd.get("name") or "Tanpa Nama")
     star = max(1, min(MAX_STAR, _safe_int(hd.get("star"), 1)))
-    gm = float(hd.get("growth_multiplier", 1.0) or 1.0)
+    gm = max(0.01, float(hd.get("growth_multiplier", 1.0) or 1.0))
     hero_cls = hd.get("cls") or hd.get("class") or "Dealer"
     if hero_cls not in CLASSES:
         hero_cls = "Dealer"
     mig_rng = random.Random("pmu_hero_mig::" + name)
+
     raw_bs = hd.get("base_stats")
     if isinstance(raw_bs, (list, tuple)) and len(raw_bs) == 5:
         try:
-            base_stats = [float(x) for x in raw_bs]
+            base_stats = [max(1.0, float(x)) for x in raw_bs]
         except Exception:
             base_stats = list(roll_random_base_stats(hero_cls, star, mig_rng))
     else:
         base_stats = list(roll_random_base_stats(hero_cls, star, mig_rng))
+
     raw_gs = hd.get("growth_stats")
     if isinstance(raw_gs, (list, tuple)) and len(raw_gs) == 5:
         try:
-            growth_stats = [float(x) for x in raw_gs]
+            growth_stats = [max(0.01, float(x)) for x in raw_gs]
         except Exception:
             growth_stats = list(roll_random_growth_stats(star, mig_rng))
     else:
         growth_stats = list(roll_random_growth_stats(star, mig_rng))
+
     raw_mpr = hd.get("mp_regen")
     mp_regen_val = _safe_int(raw_mpr, 0) if raw_mpr is not None else 0
     if mp_regen_val <= 0:
         mp_regen_val = roll_random_mp_regen(star, mig_rng)
-    raw_skills = [s for s in (hd.get("skills") or []) if s in SKILLS]
-    if not raw_skills:
-        raw_skills = roll_random_skills(hero_cls, star, gm >= 1.5, mig_rng)
+
+    has_skills_key = "skills" in hd and isinstance(hd.get("skills"), list)
+    raw_skills = hd.get("skills") or []
+    valid_skills = []
+    for s in raw_skills:
+        s_tag = _make_skill_tag(s)
+        if str(s_tag) in SKILLS:
+            valid_skills.append(s_tag)
+    if not valid_skills and not has_skills_key:
+        valid_skills = roll_random_skills(hero_cls, star, gm >= 1.5, mig_rng)
+
+    has_traits_key = ("traits" in hd) or ("perks" in hd)
     raw_traits = hd.get("traits") if hd.get("traits") is not None else (hd.get("perks") or [])
-    valid_traits = [p for p in raw_traits if p in PERKS]
+    valid_traits = []
+    for p in (raw_traits or []):
+        t_tag = _make_trait_tag(p)
+        if str(t_tag) in TRAITS:
+            valid_traits.append(t_tag)
+
     defaults = {
         "name": name,
         "star": star,
@@ -1204,7 +1547,7 @@ def ensure_hero_fields(hd):
         "growth_multiplier": gm,
         "traits": list(valid_traits),
         "perks": list(valid_traits),
-        "skills": raw_skills,
+        "skills": list(valid_skills),
         "base_stats": base_stats,
         "growth_stats": growth_stats,
         "mp_regen": mp_regen_val,
@@ -1212,7 +1555,6 @@ def ensure_hero_fields(hd):
         "alive": bool(hd.get("alive", True)),
         "hp": _safe_int(hd.get("hp"), 0),
         "blueprints": _safe_int(hd.get("blueprints"), 0),
-        # Hero Synthesis (Tahap 1): default aman untuk save lama v2.2.0
         "sanity": 100.0,
         "ego": 50.0,
         "synth_count": 0,
@@ -1221,18 +1563,15 @@ def ensure_hero_fields(hd):
     out = dict(hd)
     for k, v in defaults.items():
         out.setdefault(k, v)   # setdefault = TIDAK menimpa nilai lama yang valid
-    # Normalisasi field yang tipe-nya salah (mis. star string "3")
-    out["star"] = defaults["star"]
-    out["level"] = defaults["level"]
-    out["growth_multiplier"] = defaults["growth_multiplier"]
+    out["star"] = star
+    out["level"] = max(1, _safe_int(hd.get("level"), 1))
+    out["growth_multiplier"] = gm
     out["traits"] = defaults["traits"]
     out["perks"] = defaults["perks"]
     out["skills"] = defaults["skills"]
-    out["base_stats"] = defaults["base_stats"]
-    out["growth_stats"] = defaults["growth_stats"]
-    out["mp_regen"] = defaults["mp_regen"]
-    # Hero Synthesis: normalisasi tipe data (string "80" -> 80.0, korup -> default)
-    # dengan klem ke rentang resmi: sanity 0-100, ego 10-100, counter >= 0.
+    out["base_stats"] = base_stats
+    out["growth_stats"] = growth_stats
+    out["mp_regen"] = mp_regen_val
     out["sanity"] = round(max(0.0, min(100.0, _to_float(out.get("sanity"), 100.0))), 1)
     out["ego"] = round(max(10.0, min(100.0, _to_float(out.get("ego"), 50.0))), 1)
     out["synth_count"] = max(0, _safe_int(out.get("synth_count"), 0))
@@ -1391,12 +1730,13 @@ class Game:
             print("  Tas Battle: %d/%d item terpasang" % (
                 len(self.state.get("battle_bag", [])), cap))
             print("""
-  1. Gacha               5. Floor Climbing (Tower)
-  2. Manage Hero         6. Shop
-  3. Inventory           7. Save  |  8. Exit
-  4. Adventure / Hunt    9. Pengaturan""")
+  1. Gacha                 6. Shop
+  2. Manage Hero           7. Synthesis Chamber
+  3. Inventory             8. Craft Material
+  4. Adventure / Hunt      9. Pengaturan
+  5. Floor Climbing (Tower) 10. Save  |  0. Exit""")
             c = ask_choice("  Pilih > ",
-                           ["1", "2", "3", "4", "5", "6", "7", "8", "9"])
+                           ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "S", "s"])
             if c == "1":
                 self.gacha_menu()
             elif c == "2":
@@ -1410,14 +1750,18 @@ class Game:
             elif c == "6":
                 self.shop_menu()
             elif c == "7":
+                self.synthesis_menu()
+            elif c == "8":
+                self.craft_menu()
+            elif c == "9":
+                self.settings_menu()
+            elif c in ("10", "S", "s"):
                 self.autosave()
                 print("  Tersimpan ke %s" % self.save.path)
-            elif c == "8":
+            elif c == "0":
                 self.autosave()
                 print("  Auto-save. Sampai jumpa, Master!")
                 return
-            elif c == "9":
-                self.settings_menu()
 
     # ============================ GACHA ============================
     def gacha_menu(self):
@@ -1484,28 +1828,43 @@ class Game:
             for i, name in enumerate(keys, 1):
                 h = r[name]
                 in_party = " [PARTY]" if name in self.party.members else ""
-                print("  %3d. %-28s %s %-7s L%-3d %s%s" % (
-                    i, name[:28], "*" * h.star, h.cls, h.level,
-                    "HIDUP" if h.alive else "[GUGUR]", in_party))
-            print("   0. Kembali | masukkan nomor hero untuk opsi lanjutan")
-            c = ask_choice("  Pilih > ", ["0"] + [str(i) for i in range(1, len(keys) + 1)])
+                dead_tag = " [GUGUR]" if not h.alive else ""
+                eq_n = sum(1 for eq in h.equipment.values() if eq is not None)
+                eq_tag = (" [Equip:%d]" % eq_n) if eq_n else ""
+                tr_list = getattr(h, "traits", None) or getattr(h, "perks", None) or []
+                if tr_list:
+                    tr_strs = [("%s [CURSED]" % t if _is_cursed_trait(t) else str(t)) for t in tr_list]
+                    traits_str = ", ".join(tr_strs)
+                else:
+                    traits_str = "-"
+                print("  %3d. %-26s %s %-7s L%-2d | Traits: %s%s%s%s" % (
+                    i, name[:26], "*" * h.star, h.cls, h.level,
+                    traits_str, in_party, eq_tag, dead_tag))
+            print("   0. Kembali | J. Jual Hero | masukkan nomor hero untuk opsi lanjutan")
+            c = ask_choice("  Pilih > ", ["0", "J", "j"] + [str(i) for i in range(1, len(keys) + 1)])
             if c == "0":
                 return
+            if c in ("J", "j"):
+                self.sell_hero_menu()
+                continue
             self.hero_menu(r[keys[int(c) - 1]])
 
     def hero_menu(self, h):
         """Submenu setelah memilih hero: 1. Detail  2. Tambah/Keluarkan party
-        3. Kembali."""
+        3. Jual Hero  0. Kembali."""
         while True:
             if h.name not in self.roster():
-                return   # hero sudah tiada (mis. tertelan Ego Override)
+                return   # hero sudah tiada (mis. tertelan Ego Override / sudah dijual)
+            price = h.calc_sell_price()
+            mage_tag = " [MAGE 3x]" if str(h.cls).strip().lower() == "mage" else ""
             print("\n  Hero: %s (%s %s)" % (h.name, "*" * h.star, h.cls))
             print("  1. Detail Hero")
             print("  2. %s" % ("Keluarkan dari Party" if h.name in self.party.members
                                   else "Tambah ke Party"))
-            print("  3. Kembali")
+            print("  3. Jual Hero (%d coins)%s" % (price, mage_tag))
+            print("  0. Kembali")
             c = ask_choice("  Pilih > ", ["0", "1", "2", "3"])
-            if c == "0" or c == "3":
+            if c == "0":
                 return
             if c == "1":
                 self.hero_detail_menu(h)
@@ -1520,6 +1879,10 @@ class Game:
                     ok, msg = self.party.add(h, self.roster())
                     print("  " + msg)
                 self.autosave()
+            elif c == "3":
+                sold = self.sell_hero_menu(hero=h)
+                if sold:
+                    return
 
     def hero_detail_menu(self, h):
         """Layar Detail Hero: Stat, Kondisi Mental & Vessel, Traits, Skills,
@@ -1532,30 +1895,34 @@ class Game:
             for ln in h.detail_lines():
                 print("  " + ln)
             # Detail tiap Trait milik hero (TANPA menampilkan tier — tier rahasia!)
+            # KHUSUS Cursed Trait ditampilkan tag visual [CURSED]
             print("\n  Detail Traits Hero:")
             traits_list = getattr(h, "traits", None) or getattr(h, "perks", None) or []
             if traits_list:
                 for idx_t, tr_name in enumerate(traits_list, 1):
-                    t_info = TRAITS.get(tr_name)
+                    t_info = TRAITS.get(str(tr_name))
+                    cursed_tag = " [CURSED]" if _is_cursed_trait(tr_name) else ""
                     if t_info:
-                        print("   %d. %-18s : %s" % (idx_t, tr_name, t_info[1]))
+                        print("   %d. %-18s%s : %s" % (idx_t, str(tr_name), cursed_tag, t_info[1]))
                     else:
-                        print("   %d. %s" % (idx_t, tr_name))
+                        print("   %d. %s%s" % (idx_t, str(tr_name), cursed_tag))
             else:
                 print("   (tidak ada trait)")
             # Detail tiap Skill milik hero (TANPA menampilkan tier — tier rahasia!)
+            # KHUSUS Cursed Skill ditampilkan tag visual [CURSED]
             print("\n  Detail Skill Hero:")
             if getattr(h, "skills", None):
                 for idx_s, sk_name in enumerate(h.skills, 1):
-                    sinfo = SKILLS.get(sk_name)
+                    sinfo = SKILLS.get(str(sk_name))
+                    cursed_tag = " [CURSED]" if _is_cursed_skill(sk_name) else ""
                     if sinfo:
                         eff_mp = h.skill_mp_cost(sinfo["mp_cost"]) if hasattr(h, "skill_mp_cost") else sinfo["mp_cost"]
                         origin = sinfo.get("cls", "Universal")
-                        print("   %d. %-18s [%s | %d MP | CD %d] : %s" % (
-                            idx_s, sk_name, origin, eff_mp,
+                        print("   %d. %-18s%s [%s | %d MP | CD %d] : %s" % (
+                            idx_s, str(sk_name), cursed_tag, origin, eff_mp,
                             sinfo["cd"], sinfo["description"]))
                     else:
-                        print("   %d. %s" % (idx_s, sk_name))
+                        print("   %d. %s%s" % (idx_s, str(sk_name), cursed_tag))
             else:
                 print("   (tidak ada skill)")
             print("\n  Equipment terpasang:")
@@ -1563,13 +1930,13 @@ class Game:
             for i, s in enumerate(slots, 1):
                 eq = h.equipment.get(s)
                 print("   %d. %-9s: %s" % (i, s, eq.describe() if eq else "(kosong)"))
+            price = h.calc_sell_price()
+            mage_tag = " [MAGE 3x]" if str(h.cls).strip().lower() == "mage" else ""
             print("\n  1. Ganti / Pasang Equipment        2. Lepas Equipment")
             print("  3. Promote Star (Soulstone/Book)   4. Synthesize Hero")
-            print("  0. Kembali")
+            print("  5. Jual Hero (%d coins)%s            0. Kembali" % (price, mage_tag))
             c = ask_choice("  Pilih > ", ["0", "1", "2", "3", "4", "5"])
             if c == "0":
-                return
-            if c == "5":
                 return
             if c == "1":
                 self.equip_item_flow(h)
@@ -1581,6 +1948,10 @@ class Game:
                 self.promotion_menu(h)
             elif c == "4":
                 self.synthesis_menu(hero=h)
+            elif c == "5":
+                sold = self.sell_hero_menu(hero=h)
+                if sold:
+                    return
 
     def equip_item_flow(self, hero):
         """Pilih slot -> pilih item dari equip_bag (inventory equipment) ->
@@ -1996,11 +2367,13 @@ class Game:
             return
 
     def recover_party_sanity(self, heroes, amount=5.0):
-        """Pulihkan sanity hero party yang hidup usai memenangkan battle."""
+        """Pulihkan sanity hero party yang hidup usai memenangkan battle.
+        Hero dengan Cursed Trait 'Unstable Core' hanya pulih +1.0 sanity."""
         healed = 0
         for h in heroes:
             if h.alive and getattr(h, "sanity", 100.0) < 100.0:
-                h.sanity = min(100.0, round(float(h.sanity) + float(amount), 1))
+                rec = 1.0 if h.has("Unstable Core") else float(amount)
+                h.sanity = min(100.0, round(float(h.sanity) + rec, 1))
                 healed += 1
         if healed > 0:
             print("  ~ Ketegangan jiwa mereda: kondisi mental %d hero membaik." % healed)
@@ -2057,9 +2430,8 @@ class Game:
             print("  Gems, equipment langka. Lantai clear BISA diulang (farm).")
             print("  PERINGATAN: TIDAK ADA KABUR di Tower. Permadeath aktif!")
             print("\n  1. Masuk lantai berikutnya   2. Ulangi lantai (farm)")
-            print("  3. Promosi bintang (Soulstone/Book)   4. Craft Material")
-            print("  5. Synthesis Chamber                  0. Kembali")
-            c = ask_choice("  Pilih > ", ["0", "1", "2", "3", "4", "5"])
+            print("  3. Promosi bintang (Soulstone/Book)   0. Kembali")
+            c = ask_choice("  Pilih > ", ["0", "1", "2", "3"])
             if c == "0":
                 return
             if c in ("1", "2"):
@@ -2075,10 +2447,6 @@ class Game:
                 self.tower_floor(cf, first_clear=(c == "1"))
             elif c == "3":
                 self.promotion_menu()
-            elif c == "4":
-                self.craft_menu()
-            elif c == "5":
-                self.synthesis_menu()
 
     def tower_floor(self, floor, first_clear=False):
         """NO ESCAPE: begitu konfirmasi masuk, pertempuran WAJIB berakhir
@@ -2236,7 +2604,7 @@ class Game:
         if _safe_int(inv.get(mat_need), 0) < qty_need:
             print("  ! Material kurang: butuh %dx %s (punya %d)."
                   % (qty_need, mat_need, _safe_int(inv.get(mat_need), 0)))
-            print("    Dapatkan dari Boss Floor (kelipatan 5) lalu craft di menu Tower/Inventory.")
+            print("    Dapatkan dari Boss Floor (kelipatan 5) lalu craft di menu Craft Material / Inventory.")
             return
         if self.state["coins"] < coin_need:
             print("  ! Coins kurang (butuh %d)." % coin_need)
@@ -2334,8 +2702,12 @@ class Game:
         print("  Mental : %s  |  Kapasitas Vessel: %d/%d  |  Jiwa Terserap: %d" % (
             base_hero.mental_status_label(), base_hero.synth_count, cap,
             base_hero.absorbed_souls))
-        print("  Traits : %s" % (", ".join(base_hero.traits) if base_hero.traits else "-"))
-        print("  Skills : %s" % (", ".join(base_hero.skills) if base_hero.skills else "-"))
+        base_tr = getattr(base_hero, "traits", None) or getattr(base_hero, "perks", None) or []
+        base_tr_str = ", ".join([("%s [CURSED]" % t if _is_cursed_trait(t) else str(t)) for t in base_tr]) if base_tr else "-"
+        base_sk = getattr(base_hero, "skills", None) or []
+        base_sk_str = ", ".join([("%s [CURSED]" % s if _is_cursed_skill(s) else str(s)) for s in base_sk]) if base_sk else "-"
+        print("  Traits : %s" % base_tr_str)
+        print("  Skills : %s" % base_sk_str)
         if base_hero.synth_count >= cap:
             print("\n  [!] PERINGATAN KAPASITAS VESSEL:")
             print("      Tubuh %s telah mencapai batas daya tampung bintang ini (%d/%d)!" % (
@@ -2353,9 +2725,11 @@ class Game:
             in_p = " [PARTY]" if mc.name in self.party.members else ""
             eq_n = sum(1 for eq in mc.equipment.values() if eq is not None)
             eq_tag = (" [Equip:%d]" % eq_n) if eq_n else ""
+            mc_tr = getattr(mc, "traits", None) or getattr(mc, "perks", None) or []
+            mc_tr_str = ", ".join([("%s [CURSED]" % t if _is_cursed_trait(t) else str(t)) for t in mc_tr]) if mc_tr else "-"
             print("  %3d. %-26s %s %-7s L%-2d | Traits: %s%s%s" % (
                 i, mc.name[:26], "*" * mc.star, mc.cls, mc.level,
-                ", ".join(mc.traits) if mc.traits else "-", in_p, eq_tag))
+                mc_tr_str, in_p, eq_tag))
         print("    0. Kembali / Batal")
         c_mat = ask_choice(
             "  Pilih Hero Tumbal > ",
@@ -2401,9 +2775,22 @@ class Game:
         else:
             print("  Cahaya biru meredup... esensi %s terserap sepenuhnya ke dalam %s." % (
                 deceased.name, survivor.name))
-        if res["overload"]:
-            print("  [!] SOUL OVERLOAD: Kapasitas vessel meluap, kesadaran %s retak hebat!" % (
-                survivor.name))
+
+        if res.get("overload_failed"):
+            print("  [!!!] SOUL OVERLOAD GAGAL — VESSEL BREAKDOWN! [!!!]")
+            print("  Daya tampung tubuh %s pecah berantakan! Jiwa menolak berpadu dan memicu" % survivor.name)
+            print("  kerusakan jiwa parah serta mengikis struktur fisik & mental!")
+        elif res.get("overload"):
+            print("  [!] SOUL OVERLOAD BERHASIL DILALUI: Batas vessel terlampaui, jiwa berhasil ditaklukkan!")
+            if res.get("resonance") == "full":
+                print("  [***] RESONANSI PENUH TERCAPAI! Serapan jiwa berlipat ganda! [***]")
+            elif res.get("resonance") == "partial":
+                print("  [*] Resonansi Parsial: Frekuensi jiwa berpadu sebagian.")
+        else:
+            if res.get("resonance") == "full":
+                print("  [***] RESONANSI PENUH TERCAPAI! Serapan jiwa berlipat ganda! [***]")
+            elif res.get("resonance") == "partial":
+                print("  [*] Resonansi Parsial: Frekuensi jiwa berpadu sebagian.")
 
         cleanup = self.sacrifice_hero_cleanup(deceased.name, salvage_equip=True)
         if res["ego_override"] and base_was_in_party:
@@ -2412,38 +2799,72 @@ class Game:
                 self.state["party"] = list(self.party.members)
 
         # 6) Tampilkan hasil pada survivor (TANPA ego, GM, tier, atau persentase)
-        print("\n  === HASIL PENYATUAN JIWA ===")
-        print("  Survivor       : %s (%s %s)" % (
-            survivor.name, "*" * survivor.star, survivor.cls))
-        if res["level_after"] > res["level_before"]:
-            print("  Level          : L%d -> L%d (+%d XP jiwa)" % (
-                res["level_before"], res["level_after"], res["xp_gain"]))
+        if res.get("overload_failed"):
+            print("\n  === LAPORAN KEGAGALAN OVERLOAD (VESSEL RUSAK) ===")
+            print("  Status         : VESSEL BREAKDOWN / SOUL CORRUPTION")
+            print("  Survivor       : %s (%s %s, Level %d)" % (
+                survivor.name, "*" * survivor.star, survivor.cls, survivor.level))
+
+            sg = res["stat_gains"]
+            b_parts = ["%s %.1f" % (k.upper(), sg[k]) for k in ("hp", "atk", "def", "spd", "mp") if k in sg]
+            print("  Penurunan Base : %s" % (", ".join(b_parts)))
+
+            gg = res["growth_gains"]
+            g_parts = ["%s %.2f/Lv" % (k.upper(), gg[k]) for k in ("hp", "atk", "def", "spd", "mp") if k in gg]
+            print("  Penurunan Rise : %s" % (", ".join(g_parts)))
+
+            if res.get("broken_skills"):
+                print("  Skill Hancur   : %s" % ", ".join(str(s) for s in res["broken_skills"]))
+            else:
+                print("  Skill Hancur   : (tidak ada)")
+
+            if res.get("broken_traits"):
+                print("  Trait Hancur   : %s" % ", ".join(str(t) for t in res["broken_traits"]))
+            else:
+                print("  Trait Hancur   : (tidak ada)")
+
+            if res.get("gained_cursed_skills"):
+                print("  Cursed Skill   : %s [CURSED]" % ", ".join(str(s) for s in res["gained_cursed_skills"]))
+            if res.get("gained_cursed_traits"):
+                print("  Cursed Trait   : %s [CURSED]" % ", ".join(str(t) for t in res["gained_cursed_traits"]))
         else:
-            print("  Level          : L%d (+%d XP jiwa, XP %d/%d)" % (
-                survivor.level, res["xp_gain"], survivor.xp, survivor.xp_needed()))
+            print("\n  === HASIL PENYATUAN JIWA ===")
+            print("  Survivor       : %s (%s %s)" % (
+                survivor.name, "*" * survivor.star, survivor.cls))
+            if res.get("resonance") == "full":
+                print("  Resonansi      : RESONANSI PENUH (Seluruh kemampuan terserap, serapan maksimal!)")
+            elif res.get("resonance") == "partial":
+                print("  Resonansi      : Resonansi Parsial (Jiwa berpadu sebagian)")
 
-        sg = res["stat_gains"]
-        b_parts = []
-        for k, lbl, fmt in (("hp", "HP", "+%.1f"), ("atk", "ATK", "+%.1f"),
-                            ("def", "DEF", "+%.1f"), ("spd", "SPD", "+%.2f"),
-                            ("mp", "MP", "+%.1f")):
-            if sg.get(k, 0) > 0:
-                b_parts.append("%s %s" % (lbl, fmt % sg[k]))
-        print("  Serapan Base   : %s" % (", ".join(b_parts) if b_parts else "(batas maksimum tercapai)"))
+            if res["level_after"] > res["level_before"]:
+                print("  Level          : L%d -> L%d (+%d XP jiwa)" % (
+                    res["level_before"], res["level_after"], res["xp_gain"]))
+            else:
+                print("  Level          : L%d (+%d XP jiwa, XP %d/%d)" % (
+                    survivor.level, res["xp_gain"], survivor.xp, survivor.xp_needed()))
 
-        gg = res["growth_gains"]
-        g_parts = []
-        for k, lbl, fmt in (("hp", "HP", "+%.2f"), ("atk", "ATK", "+%.2f"),
-                            ("def", "DEF", "+%.2f"), ("spd", "SPD", "+%.3f"),
-                            ("mp", "MP", "+%.2f")):
-            if gg.get(k, 0) > 0:
-                g_parts.append("%s %s/Lv" % (lbl, fmt % gg[k]))
-        print("  Serapan Rise   : %s" % (", ".join(g_parts) if g_parts else "(batas maksimum tercapai)"))
+            sg = res["stat_gains"]
+            b_parts = []
+            for k, lbl, fmt in (("hp", "HP", "+%.1f"), ("atk", "ATK", "+%.1f"),
+                                ("def", "DEF", "+%.1f"), ("spd", "SPD", "+%.2f"),
+                                ("mp", "MP", "+%.1f")):
+                if sg.get(k, 0) > 0:
+                    b_parts.append("%s %s" % (lbl, fmt % sg[k]))
+            print("  Serapan Base   : %s" % (", ".join(b_parts) if b_parts else "(batas maksimum tercapai)"))
 
-        if res["inherited_skills"]:
-            print("  Skill Diwarisi : %s" % ", ".join(res["inherited_skills"]))
-        if res["inherited_traits"]:
-            print("  Trait Diwarisi : %s" % ", ".join(res["inherited_traits"]))
+            gg = res["growth_gains"]
+            g_parts = []
+            for k, lbl, fmt in (("hp", "HP", "+%.2f"), ("atk", "ATK", "+%.2f"),
+                                ("def", "DEF", "+%.2f"), ("spd", "SPD", "+%.3f"),
+                                ("mp", "MP", "+%.2f")):
+                if gg.get(k, 0) > 0:
+                    g_parts.append("%s %s/Lv" % (lbl, fmt % gg[k]))
+            print("  Serapan Rise   : %s" % (", ".join(g_parts) if g_parts else "(batas maksimum tercapai)"))
+
+            if res["inherited_skills"]:
+                print("  Skill Diwarisi : %s" % ", ".join(str(s) for s in res["inherited_skills"]))
+            if res["inherited_traits"]:
+                print("  Trait Diwarisi : %s" % ", ".join(str(t) for t in res["inherited_traits"]))
 
         print("  Kondisi Mental : %s -> %s  |  Vessel: %d/%d  |  Jiwa Terserap: %d" % (
             mental_before, survivor.mental_status_label(),
@@ -2457,10 +2878,102 @@ class Game:
         self.gen.register_existing(self.roster())
         self.autosave()
 
+    # ==================== BURSA PENJUALAN HERO ====================
+    def sell_hero_menu(self, hero=None):
+        """Bursa Penjualan Hero: menjual hero untuk mendapatkan Coins.
+        Harga dihitung berdasarkan:
+          - Level & Bintang dasar hero
+          - Stat efektif (HP, ATK, DEF, SPD, MP)
+          - Jumlah traits & skills yang dimiliki
+          - Kelangkaan (tier) tiap traits & skills
+          - Khusus class Mage: harga menjadi 3.0x lipat (Pick Me Up canon)
+        Equipment terpasang akan otomatis diselamatkan ke equip_bag via sacrifice_hero_cleanup."""
+        header("BURSA PENJUALAN HERO")
+        r = self.roster()
+        if not r:
+            print("  (roster kosong — tidak ada hero yang bisa dijual)")
+            return False
+
+        # Proteksi: tidak boleh menjual hero terakhir bila hanya tersisa 1 hero
+        if len(r) <= 1:
+            print("  ! Minimal harus memiliki 1 hero di roster! Tidak dapat menjual hero terakhir.")
+            return False
+
+        target_hero = hero
+        if target_hero is None:
+            keys = sorted(r.keys())
+            print("  Pilih hero yang ingin dijual:")
+            for i, name in enumerate(keys, 1):
+                h = r[name]
+                in_party = " [PARTY]" if name in self.party.members else ""
+                dead_tag = " [GUGUR]" if not h.alive else ""
+                eq_n = sum(1 for eq in h.equipment.values() if eq is not None)
+                eq_tag = (" [Equip:%d]" % eq_n) if eq_n else ""
+                price = h.calc_sell_price()
+                mage_tag = " [MAGE 3x]" if str(h.cls).strip().lower() == "mage" else ""
+                tr_list = getattr(h, "traits", None) or getattr(h, "perks", None) or []
+                if tr_list:
+                    tr_strs = [("%s [CURSED]" % t if _is_cursed_trait(t) else str(t)) for t in tr_list]
+                    traits_str = ", ".join(tr_strs)
+                else:
+                    traits_str = "-"
+                print("  %3d. %-24s %s %-7s L%-2d | %s | Harga: %d coins%s%s%s%s" % (
+                    i, name[:24], "*" * h.star, h.cls, h.level,
+                    traits_str, price, mage_tag, in_party, eq_tag, dead_tag))
+            print("    0. Kembali / Batal")
+            c = ask_choice("  Pilih nomor hero yang ingin dijual > ",
+                           ["0"] + [str(i) for i in range(1, len(keys) + 1)])
+            if c == "0":
+                return False
+            target_hero = r[keys[int(c) - 1]]
+
+        if target_hero.name not in r:
+            print("  ! Hero tidak ditemukan di roster.")
+            return False
+
+        # Tampilkan rincian hero & penawaran harga
+        price_bd = target_hero.calc_sell_breakdown()
+        price = price_bd["total_price"]
+
+        print("\n  --- DETAIL PENAWARAN BURSA HERO ---")
+        print("  Nama          : %s (%s %s, Level %d)" % (
+            target_hero.name, "*" * target_hero.star, target_hero.cls, target_hero.level))
+        print("  Traits        : %s" % (", ".join(str(t) for t in target_hero.traits) if target_hero.traits else "-"))
+        print("  Skills        : %s" % (", ".join(str(s) for s in target_hero.skills) if target_hero.skills else "-"))
+        print("  Status        : %s%s" % (
+            "HIDUP" if target_hero.alive else "GUGUR",
+            " [DALAM PARTY]" if target_hero.name in self.party.members else ""))
+        if target_hero.cls == "Mage":
+            print("  Spesial Class : [MAGE PREMIUM] Nilai jual dikalikan 3.0x lipat!")
+        print("  Harga Jual    : %d coins" % price)
+        print("  (!) Catatan   : Seluruh equipment terpasang akan dilepas dan disimpan ke Inventory.")
+        print("                  Hero yang dijual akan KELUAR dari roster secara permanen.")
+
+        confirm = ask_choice("  Konfirmasi jual %s seharga %d coins? (y/n) > " % (target_hero.name, price), ["y", "n"])
+        if confirm != "y":
+            print("  Penjualan dibatalkan.")
+            return False
+
+        # Proses penjualan hero
+        sold_name = target_hero.name
+        self.state["coins"] += price
+        cleanup = self.sacrifice_hero_cleanup(sold_name, salvage_equip=True)
+        self.autosave()
+
+        print("\n  *** PENJUALAN BERHASIL! ***")
+        print("  + %d coins diterima! (Total Coins: %d)" % (price, self.state["coins"]))
+        if cleanup.get("salvaged", 0) > 0:
+            print("  + %d item equipment telah diselamatkan ke Inventory." % cleanup["salvaged"])
+        if cleanup.get("removed_from_party"):
+            print("  * %s telah dikeluarkan dari Party." % sold_name)
+        print("  * %s telah dilepas dari Master Roster." % sold_name)
+        sleep(0.3)
+        return True
+
     # ==================== CRAFT MATERIAL (Soul & Essence) ====================
     def craft_menu(self):
         """Crafting Raw Boss Material -> Soulstone matang. Dapat diakses dari
-        menu Tower dan dari Inventory (saat memilih raw material)."""
+        menu Lobby utama (8) dan dari Inventory (saat memilih raw material)."""
         inv = self.state["inventory"]
         header("CRAFT MATERIAL — SOUL & ESSENCE")
         print("  Kumpulkan Raw Boss Material dari Boss Floor (kelipatan 5)")
@@ -2509,8 +3022,9 @@ class Game:
             print("  1. Potion HP (heal 50% HP max) — 300 coins")
             print("  2. Gacha Ticket (1 pull gratis) — 1200 coins")
             print("  3. Equipment Mystery Box — 2500 coins (masuk Inventory)")
+            print("  4. Jual Hero (Bursa Pahlawan)")
             print("  0. Kembali")
-            c = ask_choice("  Pilih > ", ["0", "1", "2", "3"])
+            c = ask_choice("  Pilih > ", ["0", "1", "2", "3", "4"])
             if c == "0":
                 return
             if c == "1":
@@ -2526,6 +3040,8 @@ class Game:
                     eq = Equipment.random()
                     self.add_equipment_to_bag(eq)
                     print("  Dapat: %s (masuk Inventory)" % eq.describe())
+            elif c == "4":
+                self.sell_hero_menu()
             self.autosave()
 
     def buy(self, price):

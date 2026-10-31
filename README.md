@@ -65,7 +65,7 @@ Ini konsep TERPENTING untuk dipahami sebelum menyentuh kode:
 
 | Lapisan | Isi | Lokasi | Saat update versi |
 |---|---|---|---|
-| **Master data** | nama hero (31.104 kombinasi), 48 traits (tabel `perks`), 240 skills (180 class + 60 universal), 48 item master, konstanta stat & bobot 6 class, pita probabilitas star 1–7, konstanta `SYNTHESIS_CONFIG` | tabel SQLite & konstanta seed | dikosongkan & **di-seed ulang otomatis** dari konstanta di `database_setup.py` — selalu kembali lengkap |
+| **Master data** | nama hero (31.104 kombinasi), 58 traits (48 normal + 10 cursed di tabel `traits`), 255 skills (240 normal + 15 cursed di tabel `skills`), 48 item master, konstanta stat & bobot 6 class, pita probabilitas star 1–7, konstanta `SYNTHESIS_CONFIG` (overload curve, failure decay, resonance) | tabel SQLite & konstanta seed | dikosongkan & **di-seed ulang otomatis** dari konstanta di `database_setup.py` — selalu kembali lengkap |
 | **Data pemain** | inventory, equipment, Tas Battle, roster hero (termasuk `sanity`, `ego`, `synth_count`, `absorbed_souls`), coins/gems, progres tower, `total_synthesized`, pengaturan | `saves/<username>.json` | **tidak pernah disentuh** patcher |
 | **Akun** | username, hash password, salt | tabel `accounts` SQLite | tidak pernah disentuh `force` |
 
@@ -118,13 +118,16 @@ dbs.backup_db()                         # salin db ke .bak (best-effort)
   `gen.register_existing(roster)` dipanggil saat load — JANGAN lewatkan,
   kalau tidak, hero hasil gacha bisa menimpa hero lama.
 - **Keunikan Penuh Per Hero (Traits, Skills Class + Universal, & Stat Random)**:
-  - **Traits per hero (dahulu Perks)**: 1–3 acak (HARD CAP 3 di semua jalur, termasuk bonus 5★/hidden) dari pool **48 Traits** di tabel `perks` (`TRAITS`).
-    Tier trait: Common 60 / Rare 30 / Epic 9 / Legendary 1 (maks 1 Legendary
-    per hero). **RAHASIA: tier trait tidak pernah ditampilkan di UI pemain.**
-  - **Skills per hero (240 Total Pool = 180 Class + 60 Universal)**:
+  - **Traits per hero (dahulu Perks)**: 1–3 acak (HARD CAP 3 saat roll gacha awal, termasuk bonus 5★/hidden) dari pool **48 Traits Normal** di tabel `traits` (`TRAITS`, dengan kolom `cursed = 0`).
+    Tier trait normal: Common 60 / Rare 30 / Epic 9 / Legendary 1 (maks 1 Legendary
+    per hero saat gacha). **RAHASIA: tier trait tidak pernah ditampilkan di UI pemain.**
+    Terdapat juga **10 Cursed Traits** (`cursed = 1`, tier `Cursed`) yang TIDAK PERNAH muncul dari gacha normal dan HANYA didapat dari kegagalan Soul Overload di Synthesis Chamber.
+  - **Skills per hero (240 Normal Skills = 180 Class + 60 Universal; 15 Cursed Skills)**:
     - **Pool Class**: 30 skill khusus untuk masing-masing dari 6 class (`Tanker`, `Dealer`, `Archer`, `Healer`, `Buffer`, `Mage` = `30 × 6 = 180` skill). Skill `Taunt` (dan seluruh variasi provokasi/aggro) **HANYA** ada di pool `Tanker` dan tidak pernah masuk Universal.
     - **Pool Universal**: 60 skill universal yang bisa dipelajari class apa pun (tanpa `Taunt`).
-    - **Roll per hero**: tiap hero mendapat **1–2 skill sesuai class-nya** + **0–3 skill Universal** tergantung keberuntungan (dan tier Common 60 / Rare 30 / Epic 9 / Legendary 1). **RAHASIA: tier skill tidak pernah ditampilkan di UI pemain.**
+    - **Roll per hero (Gacha Normal)**: tiap hero baru mendapat **1–2 skill sesuai class-nya** + **0–3 skill Universal** tergantung keberuntungan (dan tier Common 60 / Rare 30 / Epic 9 / Legendary 1). Query gacha memfilter ketat `cursed = 0`. **RAHASIA: tier skill tidak pernah ditampilkan di UI pemain.**
+    - **Pool Cursed**: 15 Cursed Skills (`cursed = 1`, tier `Cursed`) khusus kegagalan Soul Overload di Synthesis Chamber.
+  - **Penanda Visual AbilityTag**: Objek trait dan skill dibungkus class `AbilityTag(str)` yang kompatibel dengan string murni sekaligus dict (`.cursed`, `.tier`, `.get("cursed")`). Trait dan skill terkutuk menampilkan tag visual `[CURSED]` pada Detail Hero agar pemain waspada.
   - **Stat Dasar (`base_stats`) & Rise Rate (`growth_stats`) Random per hero**:
     - **Base Stat (`base_stats`)**:
       - Batas **minimum** tiap stat berbeda-beda per class (`STAT_BASE_MIN_BY_CLASS`), sedangkan batas **maksimum** tiap stat **SAMA** untuk semua class dan semua star (`STAT_BASE_MAX`):
@@ -203,7 +206,7 @@ GM_efektif = GM + 0.3 (Chosen One) + 0.5 (Late Bloomer pada level >= 30)
   berakhir Victory atau Total Party Permadeath (draw ronde 50 = kalah).
 - Lantai clear bisa diulang (farm) tanpa batas.
 - Menu Tower: 1. Lantai berikutnya, 2. Ulangi lantai, 3. Promosi bintang,
-  4. Craft Material, 5. Synthesis Chamber.
+  0. Kembali.
 
 ### Reward Tower
 
@@ -252,11 +255,16 @@ GM_efektif = GM + 0.3 (Chosen One) + 0.5 (Late Bloomer pada level >= 30)
 
 ### Hero Synthesis Chamber
 
-Fitur penyatuan jiwa terinspirasi manhwa *Pick Me Up: Infinite Gacha* — menggabungkan **Hero Wadah (Base)** dengan **Hero Tumbal (Material)** secara permanen. Dapat diakses dari 2 tempat: **Tower → 5. Synthesis Chamber** (`synthesis_menu()`) dan **Detail Hero → 4. Synthesize Hero** (`synthesis_menu(hero=h)`).
+Fitur penyatuan jiwa terinspirasi manhwa *Pick Me Up: Infinite Gacha* — menggabungkan **Hero Wadah (Base)** dengan **Hero Tumbal (Material)** secara permanen. Dapat diakses dari 2 tempat: **Lobby → 7. Synthesis Chamber** (`synthesis_menu()`) dan **Detail Hero → 4. Synthesize Hero** (`synthesis_menu(hero=h)`).
 
 - **Konstanta Master (`SYNTHESIS_CONFIG` di `database_setup.py`)**:
-  - `VESSEL_CAP_BY_STAR`: `{1: 3, 2: 5, 3: 7, 4: 10, 5: 14, 6: 18, 7: 25}` — batas aman jumlah sintesis per bintang wadah.
+  - `VESSEL_CAP_BY_STAR`: `{1: 3, 2: 5, 3: 7, 4: 10, 5: 14, 6: 18, 7: 25}` — batas aman kapasitas sintesis per bintang wadah.
   - `STAT_ABSORB_RATE_BY_STAR`: `{1: 0.25, 2: 0.32, 3: 0.40, 4: 0.50, 5: 0.60, 6: 0.72, 7: 0.85}` — rasio dasar penyerapan `base_stats` & `growth_stats` dari bintang hero tumbal.
+  - `OVERLOAD_SUCCESS_CURVE`: `(0.95, 0.89, 0.81, 0.72, 0.62, 0.51, 0.39, 0.26, 0.15, 0.08, 0.05)` — kurva peluang sukses saat melewati kapasitas aman wadah.
+  - `FULL_INHERIT_RATE_BY_STAR`: `{1: 0.05, 2: 0.08, 3: 0.12, 4: 0.18, 5: 0.25, 6: 0.35, 7: 0.50}` — peluang *Full Inherit* (mewariskan seluruh skill & trait yang kompatibel sekaligus).
+  - `RESONANCE_STAT_BONUS`: `{"full": 1.25, "partial": 1.10, "normal": 1.00}` — bonus serapan stat & rise rate.
+  - `RESONANCE_SANITY_DRAIN`: `{"full": 0.75, "partial": 0.90, "normal": 1.00}` — reduksi beban sanity.
+  - `RESONANCE_XP_BONUS`: `{"full": 1.25, "partial": 1.10, "normal": 1.00}` — efisiensi penyerapan XP.
   - `SANITY_DRAIN_BASE`: `8.0` — beban pengurangan sanity dasar per bintang hero tumbal.
   - `EGO_OVERRIDE_RATIO`: `1.6` — ambang rasio `ego_tumbal / ego_wadah` pemicu *Reverse Absorption / Ego Override*.
 - **Atribut Jiwa & Vessel pada `Hero` (`generate_hero.py`)**:
@@ -266,11 +274,93 @@ Fitur penyatuan jiwa terinspirasi manhwa *Pick Me Up: Infinite Gacha* — mengga
   - `absorbed_souls` (`int`, default `0`): total akumulasi tumbal yang pernah diserap.
 - **Alur Logika Inti (`Hero.synthesize_with(material_hero, rng=None)`)**:
   1. **Ego Override / Reverse Absorption (Kasus Han Islat)**: bila `material.ego >= base.ego * EGO_OVERRIDE_RATIO`, terdapat peluang internal (berbasis selisih ego, cap 85%) tumbal membalikkan rantai *Synthesis Chamber* dan menelan tubuh wadah (`survivor = material`, `deceased = base`). Bila `base` tadinya berada di `Party`, posisi party otomatis ditempati oleh `survivor`.
-  2. **Kapasitas Wadah & Soul Overload**: bila `survivor.synth_count >= VESSEL_CAP_BY_STAR[survivor.star]`, terjadi *Soul Overload* — rasio serapan stat dipotong 85% (`×0.15`) dan pengurangan `sanity` dikalikan `2.0`.
-  3. **Transfer XP**: menyerap 40%–60% dari akumulasi XP/level tumbal menggunakan `gain_xp()` standar (hingga `MAX_LEVEL = 99`).
-  4. **Penyerapan Stat & `GM` Rahasia**: menyerap proporsi `base_stats` dan `growth_stats` sesuai `STAT_ABSORB_RATE_BY_STAR[deceased.star]` (dengan *diminishing returns* `0.5 ** (survivor.star - deceased.star)` bila bintang tumbal lebih rendah), lalu wajib diklem dengan `clamp_stats()`. Bila `deceased.growth_multiplier > survivor.growth_multiplier`, sebagian selisihnya (25%–35%) terserap diam-diam (cap `2.5`).
-  5. **Pewarisan Skill & Trait**: mewariskan maks 1–2 skill kandidat via `can_inherit_skill()` (total maks 6 skill; skill `taunt` **terkunci ketat** hanya untuk class `Tanker`) dan maks 1 trait kandidat via `try_inherit_trait()` (**HARD CAP 3 Traits** & maks 1 Legendary).
-  6. **Beban Sanity & Pembersihan Tumbal**: mengurangi `sanity` sebesar `SANITY_DRAIN_BASE * star_tumbal * (ego_tumbal / ego_survivor)` (`×2.0` bila overload). Hero yang gugur (`deceased`) dibersihkan lewat `Game.sacrifice_hero_cleanup(deceased.name, salvage_equip=True)` sehingga seluruh equipment kembali ke `equip_bag` (`slot = None`, tanpa `.pop()`), keluar dari `Party`, serta terhapus dari `roster` dan `_hero_cache`.
+  2. **Kapasitas Wadah & Soul Overload Curve**:
+     - Sistem memeriksa `survivor.synth_count >= VESSEL_CAP_BY_STAR[survivor.star]`.
+     - Bila sudah melampaui kapasitas aman, hero masuk ke kondisi **Soul Overload**.
+     - Peluang keberhasilan diambil dari indeks overload: `idx = survivor.synth_count - cap`.
+     - Formula: `OVERLOAD_SUCCESS_CURVE[min(idx, 10)]` (mulai 95% di overload ke-0 hingga 5% di overload ke-10+). Roll dilakukan diam-diam.
+  3. **Cabang Kegagalan Soul Overload (Vessel Breakdown / Jiwa Retak)**:
+     - Bila roll overload GAGAL, sintesis berujung malapetaka fatal:
+       - **Stat Decay Masif**: Tiap stat dasar (`base_stats`), rise rate (`growth_stats`), dan hidden multiplier (`growth_multiplier`) mengalami pembusukan independen sebesar **30%–99%** (`stat *= uniform(0.01, 0.70)`). Nilai diklem ke batas bawah absolut `1.0` (base) dan `0.01` (growth & GM) **TANPA DI-RESET KE MINIMUM CLASS**.
+       - **Penghancuran Skill & Trait**: Setiap skill dan trait normal (non-cursed) memiliki peluang **60% untuk hancur permanen** (`broken_skills`, `broken_traits`).
+       - **Infestasi Kutukan Jiwa**: Terdapat peluang **50% terkena 1 Cursed Skill** acak (`gained_cursed_skills`) dan peluang **50% terkena 1 Cursed Trait** acak (`gained_cursed_traits`).
+       - **Sanity Shock**: Beban pengurangan mental dikalikan **3.0x lipat**.
+       - **Tumbal Tetap Mati Permanen**: Tumbal tetap lenyap selamanya dan peralatannya diselamatkan ke `equip_bag` (`sacrifice_hero_cleanup`).
+       - **Laporan Breakdown di UI**: Menu UI menampilkan rincian kerugian (stat yang merosot, skill/trait yang pecah, serta kutukan yang merasuki) dengan dramatis tanpa membocorkan angka persen internal.
+  4. **Cabang Keberhasilan (Sintesis Aman & Overload Sukses)**:
+     - **Resonansi Jiwa (Soul Resonance)**:
+       - `full` (Class sama & Element sama): Serapan stat & XP ×1.25, Beban Sanity ×0.75.
+       - `partial` (Class sama ATAU Element sama): Serapan stat & XP ×1.10, Beban Sanity ×0.90.
+       - `normal` (Class beda & Element beda): Serapan stat & XP ×1.00, Beban Sanity ×1.00.
+     - **Transfer XP**: Menyerap 40%–60% akumulasi XP tumbal (dikalikan pengali resonansi).
+     - **Penyerapan Stat & GM**: Menyerap proporsi `base_stats` dan `growth_stats` sesuai `STAT_ABSORB_RATE_BY_STAR[deceased.star]` (dengan *diminishing returns* `0.5 ** (survivor.star - deceased.star)` bila bintang tumbal lebih rendah) dikalikan pengali resonansi, lalu diklem batas atas `STAT_BASE_MAX` & `STAT_GROWTH_RANGE`. GM rahasia menyerap 25%–35% selisih (cap 2.5).
+     - **Sistem Pewarisan Bebas Batas (No-Cap Inheritance)**:
+       - Khusus Hero Synthesis, **batasan hard cap 6 skill, 3 trait, dan 1 Legendary trait DIHAPUS**. Hero wadah dapat mengakumulasi skill dan trait tanpa batas maksimum.
+       - Roll `Full Inherit`: bila roll lolos peluang `FULL_INHERIT_RATE_BY_STAR[deceased.star]` (5%–50%), SELURUH skill dan trait tumbal yang kompatibel diwariskan sekaligus.
+       - Bila gagal Full Inherit, roll pewarisan normal per skill dan per trait dijalankan. Skill `Taunt` tetap terkunci ketat hanya untuk class `Tanker`.
+     - **Beban Sanity Dasar**: `SANITY_DRAIN_BASE * star_tumbal * (ego_tumbal / ego_survivor) * resonansi_sanity`.
+     - **Pembersihan Tumbal**: `Game.sacrifice_hero_cleanup(deceased.name, salvage_equip=True)`.
+
+### 15 Cursed Skills & 10 Cursed Traits
+
+Efek mekanik kutukan yang didapat dari kegagalan Soul Overload:
+
+#### 15 Cursed Skills (`cursed = True`, `tier = "Cursed"`):
+| Cursed Skill | Target & Biaya | Efek Tempur di `BattleEngine` |
+|---|---|---|
+| **Soul Hemorrhage** | Musuh Tunggal (12 MP) | Menghasilkan 1.8x ATK magic damage, namun menguras 10% max HP pengguna saat digunakan. |
+| **Discordant Wail** | Semua Musuh (18 MP) | Mengurangi ATK semua musuh -15% selama 2 ronde, namun melukai semua rekan tim sebesar 5% max HP mereka. |
+| **Frenzied Betrayal** | Random Unit (8 MP) | Menyerang 1 unit acak di medan tempur (bisa kawan atau lawan) dengan 2.5x ATK physical damage. |
+| **Abyssal Gluttony** | Musuh HP Terendah (15 MP) | Memberikan 1.5x ATK damage; jika target terbunuh seketika, pemakai memulihkan 30% max HP & 20 MP. |
+| **Shattered Mind Blast** | Musuh Tunggal (10 MP) | Serangan magic 1.3x ATK dengan peluang 40% stun 1 ronde, namun menguras -5.0 Sanity pengguna. |
+| **Flesh Sacrifice** | Self Buff (0 MP) | Mengorbankan 20% current HP untuk memberikan buff +40% ATK selama 2 ronde, namun DEF menjadi 0 selama durasi. |
+| **Corrupted Heal** | Rekan Paling Kritis (16 MP) | Memulihkan 50% max HP rekan yang terluka, namun memberikan debuff -20% DEF pada target selama 2 ronde. |
+| **Blind Rampage** | 3 Target Acak (14 MP) | Melakukan 3 tebasan acak (1.0x ATK tiap tebasan) dengan akurasi tidak stabil (akurasi berkurang 25%). |
+| **Parasitic Leech** | Musuh Tunggal (10 MP) | Menghisap HP target sebesar 1.2x ATK dan mentransfer 75% dari damage tersebut sebagai heal ke pengguna. |
+| **Mana Burnout** | Semua Musuh (25 MP) | Membakar mana semua musuh (menguras MP) dan memberikan damage 1.4x ATK, namun menyetel MP pengguna ke 0. |
+| **Death Wish Gamble** | Musuh Tunggal (5 MP) | Bila HP pengguna < 25%, menghasilkan 4.0x ATK massive burst damage; bila HP ≥ 25%, hanya 0.8x ATK. |
+| **Hollow Echo** | Self Buff (12 MP) | Memantulkan 30% damage yang diterima kembali ke penyerang selama 2 ronde, namun pengguna tidak dapat menerima heal. |
+| **Cursed Provocation** | Semua Musuh (10 MP) | Memaksa semua musuh menyerang dirinya (Taunt) selama 2 ronde, namun menaikkan ATK musuh sebesar +15%. |
+| **Rotting Miasma** | Semua Unit (15 MP) | Menciptakan kabut beracun yang memberikan debuff -15% DEF ke seluruh unit di arena (termasuk kawan). |
+| **Phantom Pain Strike** | Musuh Tunggal (11 MP) | Memberikan 1.4x ATK physical damage dan memberikan efek DoT nyeri sebesar 25% ATK setiap akhir ronde selama 2 ronde. |
+
+#### 10 Cursed Traits (`cursed = True`, `tier = "Cursed"`):
+| Cursed Trait | Efek Pasif Stat & `BattleEngine` |
+|---|---|
+| **Cracked Vessel** | Stat Max HP berkurang permanen -25%, dan menerima +15% damage lebih besar dari semua sumber serangan. |
+| **Leaking Soul** | Regen MP alami per ronde menjadi 0, dan kehilangan 5 MP ekstra di setiap akhir ronde pertempuran. |
+| **Fragile Bones** | Stat DEF berkurang permanen -40%, namun SPD meningkat +15%. |
+| **Bloodlust Masochist** | Stat ATK meningkat permanen +20%, namun setiap kali melakukan serangan dasar kehilangan 8% Max HP. |
+| **Severed Nerves** | Stat SPD berkurang permanen -35%, dan memiliki peluang 20% mengalami kelumpuhan (skip turn) di tiap giliran. |
+| **Cursed Aura** | Mengurangi ATK & DEF seluruh rekan satu party sebesar -10% selama hero pemilik aura masih hidup di pertempuran. |
+| **Doomed Fate** | Tidak dapat diselamatkan oleh `Revive Feather`, trait `Last Stand`, maupun `Phoenix` (kematian bersifat mutlak). |
+| **Schizophrenic Ego** | Mengabaikan nilai Sanity; di setiap giliran terdapat peluang 35% mengalami instabilitas mental acak. |
+| **Mana Parasite** | Bila MP pengguna tidak cukup untuk menggunakan skill, otomatis menyedot paksa kekurangan MP dari kawan acak. |
+| **Unstable Core** | Ketika tewas di pertempuran, inti jiwa meledak dan memberikan damage sebesar 25% Max HP ke seluruh kawan yang hidup. Selain itu, pemulihan sanity pasca-tempur dipotong menjadi +1.0 (normal +5.0). |
+
+### Bursa Penjualan Hero (Sell Hero)
+
+Fitur penjualan hero untuk menukarkan hero yang tidak terpakai menjadi **Coins**. Dapat diakses dari 4 lokasi:
+1. **Manage Hero → Opsi J (Jual Hero)** (`manage_hero_menu()`)
+2. **Manage Hero → Pilih Hero → 3. Jual Hero** (`hero_menu(h)`)
+3. **Detail Hero → 5. Jual Hero** (`hero_detail_menu(h)`)
+4. **Shop → 4. Jual Hero (Bursa Pahlawan)** (`shop_menu()`)
+
+- **Formula Harga Jual (`HERO_SELL_CONFIG` di `database_setup.py`)**:
+  Harga dihitung secara dinamis dan objektif melalui `Hero.calc_sell_price()`:
+  1. **Star Dasar & Level**: Base price per bintang (1★: 150 ... 7★: 50.000) + kontribusi level hero (`level * 25 + level^1.3 * 10`).
+  2. **Stat Akumulatif**: Bobot nilai dari stat efektif hero (`HP*0.5 + ATK*3.0 + DEF*2.5 + SPD*4.0 + MP*0.8`).
+  3. **Jumlah Traits & Skills**: Tiap trait menyumbang +100 coins dasar, tiap skill menyumbang +75 coins dasar.
+  4. **Kelangkaan (Tier) Traits & Skills**:
+     - Trait: Common (+100), Rare (+300), Epic (+900), Legendary (+3.000), Cursed (-100).
+     - Skill: Common (+60), Rare (+180), Epic (+550), Legendary (+1.800), Cursed (-50).
+  5. **Pengali Khusus Class Mage (3.0x Lipat)**:
+     - Mengikuti canon *Pick Me Up* (Mage adalah class paling langka, eksklusif ~3% gacha), harga hero class Mage **dikalikan 3x lipat**.
+- **Perlindungan Pemain**:
+  - Seluruh equipment yang terpasang pada hero yang dijual akan **otomatis dilepas dan diselamatkan** ke Inventory/equip_bag (`sacrifice_hero_cleanup(salvage_equip=True)`).
+  - Jika hero berada di Party aktif, hero otomatis dikeluarkan dari party dengan aman.
+  - Terdapat konfirmasi `(y/n)` sebelum transaksi selesai.
+  - **Proteksi Softlock**: Sistem menolak penjualan hero terakhir di roster (`len(roster) <= 1`).
 
 ### Crafting (CRAFT_RECIPES)
 
@@ -283,7 +373,7 @@ Fitur penyatuan jiwa terinspirasi manhwa *Pick Me Up: Infinite Gacha* — mengga
 | Runic Core | High Soulstone |
 | Ectoplasm Crystal | Perfect Soul Essence |
 
-- Craft bisa diakses dari: menu Tower (4) dan Inventory (pilih raw
+- Craft bisa diakses dari: menu Lobby (8. Craft Material) dan Inventory (pilih raw
   material → opsi 4. Craft Material). Mendukung craft berulang.
 - **Material promosi TIDAK DIJUAL di Shop** — hanya drop + craft
   (permintaan eksplisit user). Jangan tambahkan soulstone/book ke shop.
@@ -332,7 +422,7 @@ Fitur penyatuan jiwa terinspirasi manhwa *Pick Me Up: Infinite Gacha* — mengga
 - Di dalam battle: skill tetap menghabiskan mana & regen per ronde
   (3–8/ronde per class) tetap berjalan — restore penuh hanya di Lobby.
 - Tampilan Lobby: coins/gems/hero hidup/floor tertinggi, party N/5, status
-  Tas Battle, menu 1–9.
+  Tas Battle, menu 1–10 & 0 (1. Gacha, 2. Manage Hero, 3. Inventory, 4. Adventure, 5. Tower, 6. Shop, 7. Synthesis Chamber, 8. Craft Material, 9. Pengaturan, 10. Save, 0. Exit).
 - **Party maks 5 hero** (`PARTY_MAX = 5`, ditegakkan di `Party.add`).
 
 ---
@@ -396,9 +486,15 @@ Fitur penyatuan jiwa terinspirasi manhwa *Pick Me Up: Infinite Gacha* — mengga
 
 ## 13. Database (database_setup.py)
 
-Tabel: `hero_names` (31.104 baris), `perks` (48 traits), `skills` (240 skills = 180 class + 60 universal), `items_master` (48),
+Tabel: `hero_names` (31.104 baris), `traits` (58 traits = 48 normal + 10 cursed; menggantikan tabel `perks`), `skills` (255 skills = 180 class + 60 universal + 15 cursed), `items_master` (48),
 `class_stats` (6), `star_mults` (7), `accounts`, `meta`.
 
+- **Skema & Migrasi Tabel `traits` & Kolom `cursed`**:
+  - Tabel `perks` lama di-drop via `DROP TABLE IF EXISTS perks` dan digantikan tabel `traits` (`id`, `name`, `tier`, `description`, `cursed`).
+  - Kolom boolean `cursed INTEGER NOT NULL DEFAULT 0` ditambahkan pada tabel `traits` dan `skills`.
+  - Fungsi query baru: `get_traits()`, `load_traits()`, `get_cursed_traits()`, `get_cursed_skills()`, serta fungsi alias lama `get_perks()` dan `load_perks()` untuk kompatibilitas penuh.
+  - Kompatibilitas Python & Savegame: class `Hero` memiliki getter & setter `@property def perks` yang terhubung dua arah dengan `self.traits`. Fungsi migrasi `ensure_hero_fields()` membaca key `"perks"` maupun `"traits"` tanpa kehilangan data pemain.
+  - Nilai stat yang terdegradasi akibat kegagalan Soul Overload (di bawah class min) tetap dipertahankan dengan batas bawah `1.0` (base) dan `0.01` (growth), tanpa di-reset paksa ke batas minimum class saat savegame dimuat ulang.
 - **Seeding idempotent**: `INSERT OR IGNORE` + PRIMARY KEY/UNIQUE teks.
   PELAJARAN PENTING: SQLite `UNIQUE` memperlakukan NULL sebagai berbeda
   per baris — kolom unique nullable WAJIB disimpan `''` (string kosong),
@@ -423,7 +519,7 @@ Daftar ini adalah permintaan eksplisit user — melanggarnya = regresi:
 3. **Jangan menampilkan Hidden Potential** (label tier, angka GM, marker
    hasil gacha). Mekaniknya bekerja diam-diam; pemain tidak boleh tahu
    hero mana yang istimewa.
-3b. **Jangan menampilkan tier dari Traits maupun Skills** (Common/Rare/Epic/Legendary), persentase peluang sintesis, maupun nilai **`ego`** di UI pemain — seluruhnya bersifat rahasia dan hanya untuk kalkulasi internal (roll & Hero Synthesis).
+3b. **Jangan menampilkan tier dari Traits maupun Skills** (Common/Rare/Epic/Legendary), persentase peluang sintesis/overload, angka GM (Hidden Potential), maupun nilai **`ego`** di UI pemain — seluruhnya bersifat rahasia dan hanya untuk kalkulasi internal. Khusus trait & skill terkutuk, penanda visual `[CURSED]` **wajib ditampilkan** di samping nama ability agar pemain mengetahui kondisi kutukan hero.
 4. **Jangan menghapus progres pemain saat update** — tidak boleh ada kode
    yang menghapus savegame/akun otomatis; migrasi harus selalu additive.
 5. **Jangan menjamin drop raw boss material** (harus 5% murni).
@@ -441,8 +537,8 @@ Daftar ini adalah permintaan eksplisit user — melanggarnya = regresi:
     BattleEngine (harus referensi langsung).
 13. **Jangan menaruh stat master di savegame** atau data pemain di database
     — ikuti pemisahan dua lapisan (seksi 3).
-14. **Jangan mengubah batas party** dari 5 hero, kapasitas tas battle dari
-    2×hero, atau perk cap dari 3.
+14. **Jangan mengubah batas party** dari 5 hero atau kapasitas tas battle dari
+    2×hero. Trait cap maks 3 berlaku saat hero generation/gacha awal, sedangkan pada **Hero Synthesis** diberlakukan sistem No-Cap inheritance.
 
 ---
 
@@ -527,9 +623,13 @@ import main as M
 | `adventure` | sesi adventure + tabel encounter rahasia |
 | `tower_menu`, `tower_floor`, `reward_tower` | Tower NO ESCAPE (boss 3F + minion 2F) |
 | `promotion_menu(hero=None)` | star promotion 1→7 |
-| `synthesis_menu(hero=None)` | Hero Synthesis Chamber (Tower & Detail Hero) |
-| `Hero.synthesize_with` (`generate_hero.py`) | logika inti sintesis, Ego Override, serapan stat/XP/skill/trait & sanity |
-| `craft_menu` | crafting raw → soulstone |
+| `synthesis_menu(hero=None)` | Hero Synthesis Chamber (Lobby & Detail Hero) |
+| `Hero.synthesize_with` (`generate_hero.py`) | logika inti sintesis, Ego Override, Overload Curve, Failure Penalties (decay 30%-99%, destroy 60%, cursed infestation 50%), No-Cap & Resonance |
+| `sell_hero_menu(hero=None)` | Bursa Penjualan Hero (Manage Hero & Shop) |
+| `Hero.calc_sell_price` (`generate_hero.py`) | kalkulasi harga jual hero (level, stat, jumlah & rarity trait/skill, Mage 3x) |
+| `AbilityTag`, `_make_trait_tag`, `_make_skill_tag` | pembungkus string/dict ability dengan properti `.cursed`, `.tier`, `.get("cursed")` |
+| `get_overload_success_rate` (`database_setup.py`) | penghitung peluang lolos Overload Curve berdasarkan synth_count vs vessel cap |
+| `craft_menu` | crafting raw → soulstone (Lobby & Inventory) |
 | `shop_menu` | potion, gacha ticket, mystery box (TANPA material) |
 | `post_battle_events` | Hidden Boss raid pasca-clear Tower |
 | `settings_menu`, `apply_settings` | battle fast mode per-akun |
@@ -553,5 +653,5 @@ import main as M
 
 ---
 
-*Dokumentasi terakhir diperbarui pada versi game 2.3.0. Simpan file ini
+*Dokumentasi terakhir diperbarui pada versi game 2.4.0 (Hero Synthesis Chamber & Cursed System Update). Simpan file ini
 bersama kode; perbarui setiap mengubah mekanik.*

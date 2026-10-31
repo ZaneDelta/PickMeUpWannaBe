@@ -4,7 +4,8 @@
 # ----------------------------------------------------------------------
 #  Modul ini membuat & mengisi game_database.db:
 #    - hero_names    : ribuan kombinasi (nama depan, belakang, gelar)
-#    - perks         : nama, tier, deskripsi efek perk
+#    - traits        : nama, tier, deskripsi efek trait, & flag cursed
+#    - skills        : skill class, universal, & cursed (beserta flag cursed)
 #    - items_master  : equipment (Senjata/Zirah/Aksesori), potion, material
 #    - class_stats   : stat dasar & growth per class (Mage langka ~3%)
 #    - star_mults    : multiplier stat per star 1-7
@@ -17,7 +18,7 @@ import sqlite3
 
 DB_PATH = os.environ.get("PMU_DB_PATH") or \
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "game_database.db")
-DB_VERSION = "2.0.0"
+DB_VERSION = "2.4.0"
 
 # ---------------------- DATA SUMBER (seed) ----------------------
 # Nama prosedural: 36 x 32 x 26 = 29.952 kombinasi nama unik
@@ -213,6 +214,22 @@ TRAITS = {
     "Infinite Mana":   ("Legendary", "Max MP +50%, MP regen +150%, biaya MP -20%"),
     "Celestial Grace": ("Legendary", "Semua stat +18%, efek heal +25%"),
 }
+
+# 10 Cursed Traits (cursed = 1, tier = "Cursed") — HANYA dari kegagalan Soul Overload!
+CURSED_TRAITS_POOL = {
+    "Cracked Vessel":      ("Cursed", "Max HP berkurang -25% dan menerima +15% damage tambahan dari semua serangan."),
+    "Leaking Soul":        ("Cursed", "Tidak mendapat regenerasi MP per ronde di dalam battle, malahan kehilangan 5 MP setiap pergantian ronde."),
+    "Schizophrenic Ego":   ("Cursed", "Peluang terpicunya Mental Instability (Soul Berserk / Memory Echo) menjadi 35% di setiap giliran meskipun sanity >= 40.0."),
+    "Fragile Bones":       ("Cursed", "DEF total dipotong -40%, namun SPD meningkat +15%."),
+    "Mana Parasite":       ("Cursed", "Biaya MP semua skill menjadi 2x lipat; jika MP sendiri kurang, sisanya disedot paksa dari MP rekan party acak."),
+    "Cursed Aura":         ("Cursed", "Selama hero ini hidup di party, seluruh rekan satu party lainnya mengalami penurunan ATK dan DEF sebesar -10%."),
+    "Bloodlust Masochist": ("Cursed", "ATK +20%, namun setiap kali melakukan aksi serangan (basic attack maupun skill ofensif), kehilangan 8% Max HP sendiri."),
+    "Severed Nerves":      ("Cursed", "SPD dipotong -35% dan memiliki peluang 20% lumpuh (melewatkan giliran) saat gilirannya tiba di battle."),
+    "Doomed Fate":         ("Cursed", "Menolak kebangkitan: saat HP mencapai 0, Revive Feather, Last Stand, dan Phoenix TIDAK AKAN AKTIF (langsung gugur)."),
+    "Unstable Core":       ("Cursed", "Pemulihan sanity pasca-menang battle hanya +1.0; jika mati di tengah pertarungan, jiwanya meledak melukai seluruh rekan party hidup sebesar 25% Max HP."),
+}
+CURSED_TRAITS = CURSED_TRAITS_POOL
+
 # Alias backward-compatibility untuk modul/kode lama
 PERKS = TRAITS
 
@@ -487,7 +504,28 @@ UNIVERSAL_SKILLS = {
     "Soul Harvest":       ("Legendary", 40, 4, "drain",      2.15, "Panen jiwa 2.15x ATK + lifesteal 40%"),
 }
 
-# Gabungan seluruh 240 skill: nama -> (cls, tier, mp_cost, cd, kind, mult, description)
+# 15 Cursed Skills (cursed = 1, tier = "Cursed") — HANYA dari kegagalan Soul Overload!
+# Format: nama: (tier, mp_cost, cd, kind, mult, description)
+CURSED_SKILLS_POOL = {
+    "Soul Hemorrhage":      ("Cursed", 18, 2, "cursed_self_dmg_pierce", 2.20, "Serang 1 musuh 220% ATK (abaikan DEF), namun menguras 25% Max HP pemakai."),
+    "Discordant Wail":      ("Cursed", 15, 3, "cursed_aoe_ally_debuff", 0.60, "Serangan AoE 60% ATK ke semua musuh, namun menurunkan DEF seluruh rekan party -25% selama 2 ronde."),
+    "Frenzied Betrayal":    ("Cursed", 12, 2, "cursed_betrayal_hit",    1.60, "Serang 1 target 160% ATK, namun peluang 40% salah sasaran menghantam rekan satu party sendiri."),
+    "Abyssal Gluttony":     ("Cursed", 10, 3, "cursed_mp_leech_party",  1.10, "Menyedot 30% MP saat ini dari seluruh rekan party lain untuk memulihkan 25% Max HP pemakai dan menyerang 1 musuh 110% ATK."),
+    "Shattered Mind Blast": ("Cursed", 20, 3, "cursed_aoe_sanity_drain",1.30, "Serangan AoE 130% ATK ke seluruh musuh, namun mengurangi sanity pemakai -10.0 dan memberi stun pada diri sendiri 1 ronde."),
+    "Flesh Sacrifice":      ("Cursed", 14, 3, "cursed_zero_def_burst",  1.80, "Memangkas DEF pemakai menjadi 0 selama 2 ronde demi menaikkan ATK +80% (2 ronde) dan menerjang 1 musuh 180% ATK."),
+    "Corrupted Heal":       ("Cursed", 16, 2, "cursed_poison_heal",     0.45, "Heal rekan party paling kritis 45% Max HP, namun membakar 20% Max HP pemakai dan menurunkan ATK target -20% (2 ronde)."),
+    "Blind Rampage":        ("Cursed", 15, 3, "cursed_blind_multihit",  0.75, "Menyerang musuh acak 3 kali (75% ATK per hit); tiap tebasan peluang 50% meleset dan menguras 5% Max HP pemakai per ayunan."),
+    "Parasitic Leech":      ("Cursed", 12, 3, "cursed_ally_hp_steal",   1.00, "Mencuri 15% Max HP dari rekan satu party lain yang memiliki HP tertinggi untuk menyembuhkan diri sendiri (jika sendirian, melukai diri sendiri 10% Max HP)."),
+    "Mana Burnout":         ("Cursed", 10, 3, "cursed_all_mp_pierce",   1.50, "Menguras 100% sisa MP pemakai hingga 0 untuk melepaskan serangan tembus DEF 150% ATK ke 1 musuh."),
+    "Death Wish Gamble":    ("Cursed", 20, 3, "cursed_gamble_strike",   3.00, "50% peluang menghasilkan tebasan 300% ATK ke 1 musuh, 50% peluang gagal total (0 damage) dan HP pemakai terpangkas menjadi 1 HP."),
+    "Hollow Echo":          ("Cursed", 10, 2, "cursed_skip_self_harm",  0.00, "Jiwa gagal merespons; menghabiskan MP sia-sia, melewatkan giliran, dan melukai diri sendiri 8% Max HP."),
+    "Cursed Provocation":   ("Cursed", 12, 3, "cursed_suicide_taunt",   0.00, "Memaksa seluruh musuh mengincar pemakai selama 2 ronde (efek Taunt), namun menurunkan DEF pemakai -35% selama 2 ronde."),
+    "Rotting Miasma":       ("Cursed", 16, 3, "cursed_all_field_decay", 0.10, "Mengurangi 10% HP saat ini dari SEMUA unit yang hidup di medan tempur (seluruh musuh sekaligus seluruh rekan satu party)."),
+    "Phantom Pain Strike":  ("Cursed", 15, 2, "cursed_recoil_stun",     1.40, "Menyerang 1 musuh 140% ATK + peluang stun, namun pemakai menerima 50% dari damage yang masuk sebagai recoil ke diri sendiri."),
+}
+CURSED_SKILLS = CURSED_SKILLS_POOL
+
+# Gabungan seluruh 240 skill normal: nama -> (cls, tier, mp_cost, cd, kind, mult, description)
 SKILLS = {}
 for _cls_name, _sdict in CLASS_SKILLS.items():
     for _sname, (_t, _mp, _cd, _k, _m, _d) in _sdict.items():
@@ -601,25 +639,124 @@ STAT_ABSORB_RATE_BY_STAR = {
 SANITY_DRAIN_BASE = 8.0
 EGO_OVERRIDE_RATIO = 1.6
 
+# Soul Overload & Penalti Kegagalan (Vessel Breakdown)
+OVERLOAD_SUCCESS_CURVE = (0.95, 0.89, 0.81, 0.72, 0.62, 0.51, 0.39, 0.26, 0.15, 0.08, 0.05)
+OVERLOAD_FAIL_STAT_DECAY_RANGE = (0.30, 0.99)
+OVERLOAD_FAIL_ABILITY_DESTROY_RATE = 0.60
+CURSED_SKILL_GAIN_RATE = 0.50
+CURSED_TRAIT_GAIN_RATE = 0.50
+OVERLOAD_FAIL_SANITY_MULT = 3.0
+OVERLOAD_SUCCESS_SANITY_MULT = 1.5
+
+# Pewarisan Skill & Trait Tanpa Cap + Resonance Stat
+FULL_INHERIT_RATE_BY_STAR = {1: 0.10, 2: 0.12, 3: 0.15, 4: 0.18, 5: 0.22, 6: 0.26, 7: 0.30}
+SINGLE_SKILL_INHERIT_BASE = 0.35
+SINGLE_TRAIT_INHERIT_BASE = 0.25
+INHERIT_STAR_BONUS = 0.05
+FULL_RESONANCE_STAT_MULT = 1.50
+PARTIAL_RESONANCE_STAT_BONUS = 0.10
+
 SYNTHESIS_CONFIG = {
-    # Batas aman jumlah sintesis (penyerapan tumbal) per star WADAH (1★-7★).
-    # Contoh: hero 3★ hanya bisa menyerap maksimal 7 tumbal pada star itu;
-    # promote_star() mereset synth_count sehingga kapasitas baru terbuka.
     "VESSEL_CAP_BY_STAR": dict(VESSEL_CAP_BY_STAR),
-    # Rasio dasar penyerapan base_stats & growth_stats dari hero TUMBAL,
-    # di-key menurut star TUMBAL (1★-7★). Contoh: menyerap tumbal 4★
-    # menambahkan 50% base/growth stat tumbal ke wadah (dipakai di Tahap 2).
     "STAT_ABSORB_RATE_BY_STAR": dict(STAT_ABSORB_RATE_BY_STAR),
-    # Beban sanity dasar PER BINTANG hero tumbal:
-    #   drain = SANITY_DRAIN_BASE * star_tumbal
-    # Contoh: tumbal 4★ membebani sanity wadah 8.0 x 4 = 32.0 poin (0-100).
     "SANITY_DRAIN_BASE": SANITY_DRAIN_BASE,
-    # Ambang Reverse Absorption / Ego Override (RAHASIA): bila
-    # ego_tumbal / ego_wadah >= rasio ini, tumbal membalikkan keadaan dan
-    # memakan wadahnya. Hero 1★ Hidden Potential (ego 80-98) adalah kandidat
-    # utama — canon: jiwa kecil bisa melahap tuan rumahnya.
     "EGO_OVERRIDE_RATIO": EGO_OVERRIDE_RATIO,
+    "OVERLOAD_SUCCESS_CURVE": OVERLOAD_SUCCESS_CURVE,
+    "OVERLOAD_FAIL_STAT_DECAY_RANGE": OVERLOAD_FAIL_STAT_DECAY_RANGE,
+    "OVERLOAD_FAIL_ABILITY_DESTROY_RATE": OVERLOAD_FAIL_ABILITY_DESTROY_RATE,
+    "CURSED_SKILL_GAIN_RATE": CURSED_SKILL_GAIN_RATE,
+    "CURSED_TRAIT_GAIN_RATE": CURSED_TRAIT_GAIN_RATE,
+    "OVERLOAD_FAIL_SANITY_MULT": OVERLOAD_FAIL_SANITY_MULT,
+    "OVERLOAD_SUCCESS_SANITY_MULT": OVERLOAD_SUCCESS_SANITY_MULT,
+    "FULL_INHERIT_RATE_BY_STAR": dict(FULL_INHERIT_RATE_BY_STAR),
+    "SINGLE_SKILL_INHERIT_BASE": SINGLE_SKILL_INHERIT_BASE,
+    "SINGLE_TRAIT_INHERIT_BASE": SINGLE_TRAIT_INHERIT_BASE,
+    "INHERIT_STAR_BONUS": INHERIT_STAR_BONUS,
+    "FULL_RESONANCE_STAT_MULT": FULL_RESONANCE_STAT_MULT,
+    "PARTIAL_RESONANCE_STAT_BONUS": PARTIAL_RESONANCE_STAT_BONUS,
 }
+
+# ==================== HERO SELL (BURSA PAHLAWAN) CONFIG ====================
+# Harga jual hero bergantung pada:
+# 1. Star dasar & Level (semakin tinggi level, semakin berharga)
+# 2. Stat efektif/akumulatif (HP, ATK, DEF, SPD, MP)
+# 3. Jumlah trait & skill yang dimiliki (banyak kemampuan = nilai tinggi)
+# 4. Kelangkaan (tier) tiap trait (Common, Rare, Epic, Legendary; Cursed)
+# 5. Kelangkaan (tier) tiap skill
+# 6. Pengali khusus class Mage: 3.0x lipat (Canon Pick Me Up: Mage sangat langka & mahal)
+HERO_SELL_CONFIG = {
+    "BASE_PRICE_BY_STAR": {
+        1: 150,
+        2: 400,
+        3: 1000,
+        4: 3000,
+        5: 8000,
+        6: 20000,
+        7: 50000,
+    },
+    "LEVEL_MULT_BASE": 25,
+    "LEVEL_EXP_FACTOR": 10.0,
+    "LEVEL_EXP_POWER": 1.3,
+    "STAT_WEIGHTS": {
+        "hp": 0.5,
+        "atk": 3.0,
+        "def": 2.5,
+        "spd": 4.0,
+        "mp": 0.8,
+    },
+    "COUNT_VALUE_PER_TRAIT": 100,
+    "COUNT_VALUE_PER_SKILL": 75,
+    "TRAIT_TIER_VALUE": {
+        "Common": 100,
+        "Rare": 300,
+        "Epic": 900,
+        "Legendary": 3000,
+        "Cursed": -100,
+    },
+    "SKILL_TIER_VALUE": {
+        "Common": 60,
+        "Rare": 180,
+        "Epic": 550,
+        "Legendary": 1800,
+        "Cursed": -50,
+    },
+    "MAGE_MULTIPLIER": 3.0,
+    "MIN_PRICE": 100,
+}
+
+
+def get_overload_success_rate(synth_count_or_hero, vessel_cap=None, star=None):
+    """Hitung peluang keberhasilan sintesis (RAHASIA, 0.05..1.0):
+      - Selama synth_count < vessel_cap -> 1.0 (100% berhasil).
+      - Saat masuk fase Soul Overload (synth_count >= vessel_cap) ->
+        OVERLOAD_SUCCESS_CURVE[min(delta, len(curve)-1)] di mana
+        delta = synth_count - vessel_cap.
+    Mendukung pemanggilan fleksibel:
+      - get_overload_success_rate(hero_obj)
+      - get_overload_success_rate(synth_count, vessel_cap)
+      - get_overload_success_rate(synth_count, star=1)
+      - get_overload_success_rate(delta)  (bila hanya 1 argumen int diberikan)."""
+    curve = SYNTHESIS_CONFIG["OVERLOAD_SUCCESS_CURVE"]
+    if hasattr(synth_count_or_hero, "synth_count"):
+        sc = int(getattr(synth_count_or_hero, "synth_count", 0))
+        if hasattr(synth_count_or_hero, "vessel_cap"):
+            cap = int(synth_count_or_hero.vessel_cap())
+        else:
+            s = max(1, min(7, int(getattr(synth_count_or_hero, "star", 1))))
+            cap = int(VESSEL_CAP_BY_STAR.get(s, 3))
+        delta = sc - cap
+    elif vessel_cap is not None:
+        delta = int(synth_count_or_hero) - int(vessel_cap)
+    elif star is not None:
+        s = max(1, min(7, int(star)))
+        cap = int(VESSEL_CAP_BY_STAR.get(s, 3))
+        delta = int(synth_count_or_hero) - cap
+    else:
+        delta = int(synth_count_or_hero)
+    if delta < 0:
+        return 1.0
+    idx = min(delta, len(curve) - 1)
+    return float(curve[idx])
 
 
 # ===================== INISIALISASI DATABASE =====================
@@ -636,7 +773,7 @@ def init_db(path=None, force=False, wipe_accounts=False):
     """Buat tabel + isi seed data. Return path database.
 
     AMAN UNTUK UPDATE VERSI:
-      force=True -> refresh HANYA tabel data game (hero_names, perks,
+      force=True -> refresh HANYA tabel data game (hero_names, traits, skills,
         items_master, class_stats, star_mults) dari seed. Tabel accounts
         (username & password pemain) TIDAK PERNAH disentuh, dan file save
         pemain (saves/*.json) tidak ada hubungannya dengan database —
@@ -644,17 +781,17 @@ def init_db(path=None, force=False, wipe_accounts=False):
       wipe_accounts=True -> HAPUS juga semua akun. DESTRUKTIF; hanya untuk
         reset total yang disengaja (dipisah dari force agar tak terjadi
         kehilangan akun karena salah flag).
-    Idempotent: seeding memakai INSERT OR IGNORE sehingga aman dipanggil ulang."""
+    Idempotent: seeding memakai INSERT OR IGNORE/REPLACE sehingga aman dipanggil ulang."""
     p = path or DB_PATH
     conn = get_db(p, timeout=10.0)
     try:
         cur = conn.cursor()
-        _create_tables(conn)          # CREATE IF NOT EXISTS — tidak pernah drop
+        _create_tables(conn)
         if wipe_accounts:
             cur.execute("DELETE FROM accounts")
         if force:
             # Hapus isi tabel DATA GAME saja; accounts dibiarkan utuh.
-            for t in ("hero_names", "perks", "skills", "items_master",
+            for t in ("hero_names", "traits", "skills", "items_master",
                       "class_stats", "star_mults"):
                 cur.execute("DELETE FROM %s" % t)
         _seed_all(conn)
@@ -668,6 +805,8 @@ def init_db(path=None, force=False, wipe_accounts=False):
 def _create_tables(conn):
     """Skema tabel. PRIMARY KEY teks mencegah duplikasi data seed."""
     cur = conn.cursor()
+    # Bersihkan tabel lama `perks` (telah digantikan oleh tabel `traits`)
+    cur.execute("DROP TABLE IF EXISTS perks")
     # 1) hero_names: ribuan kombinasi (depan, belakang, gelar)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS hero_names (
@@ -677,14 +816,18 @@ def _create_tables(conn):
             title      TEXT,
             UNIQUE(first_name, last_name, title)
         )""")
-    # 2) perks: nama unik + tier + deskripsi efek (efek nyata di BattleEngine)
+    # 2) traits: nama unik + tier + deskripsi efek + kolom boolean cursed (0/1)
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS perks (
+        CREATE TABLE IF NOT EXISTS traits (
             name        TEXT PRIMARY KEY,
             tier        TEXT NOT NULL,
-            description TEXT NOT NULL
+            description TEXT NOT NULL,
+            cursed      INTEGER NOT NULL DEFAULT 0
         )""")
-    # 2b) skills: pool 240 skill (30 per class x 6 + 60 Universal)
+    trait_cols = [r[1] for r in cur.execute("PRAGMA table_info(traits)").fetchall()]
+    if "cursed" not in trait_cols:
+        cur.execute("ALTER TABLE traits ADD COLUMN cursed INTEGER NOT NULL DEFAULT 0")
+    # 2b) skills: pool 240 skill normal + 15 cursed skill (beserta kolom cursed 0/1)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS skills (
             name        TEXT PRIMARY KEY,
@@ -694,12 +837,14 @@ def _create_tables(conn):
             cd          INTEGER NOT NULL,
             kind        TEXT NOT NULL,
             mult        REAL NOT NULL,
-            description TEXT NOT NULL
+            description TEXT NOT NULL,
+            cursed      INTEGER NOT NULL DEFAULT 0
         )""")
-    try:
+    skill_cols = [r[1] for r in cur.execute("PRAGMA table_info(skills)").fetchall()]
+    if "cls" not in skill_cols:
         cur.execute("ALTER TABLE skills ADD COLUMN cls TEXT NOT NULL DEFAULT 'Universal'")
-    except sqlite3.Error:
-        pass
+    if "cursed" not in skill_cols:
+        cur.execute("ALTER TABLE skills ADD COLUMN cursed INTEGER NOT NULL DEFAULT 0")
     # 3) items_master: semua item (equipment/potion/material/ticket)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS items_master (
@@ -748,7 +893,7 @@ def _create_tables(conn):
 
 
 def _seed_all(conn):
-    """Isi semua tabel seed. INSERT OR IGNORE = idempotent, tidak pernah duplikat."""
+    """Isi semua tabel seed. INSERT OR IGNORE/REPLACE = idempotent."""
     cur = conn.cursor()
     # hero_names: gabungkan SEMUA kombinasi (36 x 32 x 26 = 29.952 + 1.152
     # tanpa gelar = 31.104 baris). CATATAN: title disimpan STRING KOSONG
@@ -763,15 +908,20 @@ def _seed_all(conn):
     cur.executemany(
         "INSERT OR IGNORE INTO hero_names (first_name, last_name, title) VALUES (?,?,?)",
         rows)
-    # traits (tabel perks dipertahankan namanya untuk kompatibilitas DB lama)
+    # traits: 48 normal traits (cursed=0) + 10 cursed traits (cursed=1)
+    trait_rows = [(n, t, d, 0) for n, (t, d) in TRAITS.items()]
+    trait_rows += [(n, t, d, 1) for n, (t, d) in CURSED_TRAITS_POOL.items()]
     cur.executemany(
-        "INSERT OR IGNORE INTO perks (name, tier, description) VALUES (?,?,?)",
-        [(n, t, d) for n, (t, d) in TRAITS.items()])
-    # skills (30 per class x 6 + 60 Universal = 240 skill)
+        "INSERT OR REPLACE INTO traits (name, tier, description, cursed) VALUES (?,?,?,?)",
+        trait_rows)
+    # skills: 240 normal skills (cursed=0) + 15 cursed skills (cursed=1)
+    skill_rows = [(n, c, t, mp, cd, k, m, d, 0) for n, (c, t, mp, cd, k, m, d) in SKILLS.items()]
+    skill_rows += [("Cursed", t, mp, cd, k, m, d, n) for n, (t, mp, cd, k, m, d) in CURSED_SKILLS_POOL.items()]
     cur.executemany(
-        "INSERT OR IGNORE INTO skills (name, cls, tier, mp_cost, cd, kind, mult, description) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        [(n, c, t, mp, cd, k, m, d) for n, (c, t, mp, cd, k, m, d) in SKILLS.items()])
+        "INSERT OR REPLACE INTO skills (name, cls, tier, mp_cost, cd, kind, mult, description, cursed) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        [(n, c, t, mp, cd, k, m, d, 0) for n, (c, t, mp, cd, k, m, d) in SKILLS.items()] +
+        [(n, "Cursed", t, mp, cd, k, m, d, 1) for n, (t, mp, cd, k, m, d) in CURSED_SKILLS_POOL.items()])
     # items_master: seluruh equipment per slot & tier
     eq_rows = []
     for slot, tiers in EQUIP_NAMES.items():
@@ -873,38 +1023,80 @@ def load_star_mults(path=None):
     return out
 
 
-def load_perks(path=None):
-    """Return {nama_trait: (tier, deskripsi)} dengan fallback konstanta seed."""
-    out = {}
+def get_traits(path=None, include_cursed=True):
+    """Return list of dict dari tabel traits:
+    [{'name': str, 'tier': str, 'description': str, 'cursed': bool}, ...]."""
+    by_name = {}
     try:
         conn = get_db(path)
         try:
-            for r in conn.execute("SELECT name, tier, description FROM perks"):
-                out[r["name"]] = (r["tier"], r["description"])
+            for r in conn.execute("SELECT name, tier, description, cursed FROM traits"):
+                is_c = bool(r["cursed"])
+                if not include_cursed and is_c:
+                    continue
+                by_name[r["name"]] = {
+                    "name": r["name"],
+                    "tier": r["tier"],
+                    "description": r["description"],
+                    "cursed": is_c,
+                }
         finally:
             conn.close()
     except sqlite3.Error:
         pass
-    # Pastikan seluruh trait baru dari seed selalu tersedia
-    for k, v in TRAITS.items():
-        out.setdefault(k, v)
+    for n, (t, d) in TRAITS.items():
+        by_name.setdefault(n, {"name": n, "tier": t, "description": d, "cursed": False})
+    if include_cursed:
+        for n, (t, d) in CURSED_TRAITS_POOL.items():
+            by_name.setdefault(n, {"name": n, "tier": t, "description": d, "cursed": True})
+    return list(by_name.values())
+
+
+# Alias backward-compatibility
+get_perks = get_traits
+
+
+def get_cursed_traits(path=None):
+    """Return list of dict seluruh Cursed Traits (cursed == True)."""
+    return [t for t in get_traits(path, include_cursed=True) if t.get("cursed")]
+
+
+def load_traits(path=None, include_cursed=True):
+    """Return {nama_trait: (tier, deskripsi)} dari tabel traits dengan fallback seed."""
+    out = {}
+    for item in get_traits(path, include_cursed=include_cursed):
+        out[item["name"]] = (item["tier"], item["description"])
     return out
 
 
-# Alias resmi: traits (dahulu perks)
-load_traits = load_perks
+# Alias backward-compatibility untuk kode lama
+load_perks = load_traits
 
 
-def load_skills(path=None):
-    """Return {nama_skill: {cls, tier, mp_cost, cd, kind, mult, description}}
+def get_skills(path=None, include_cursed=True):
+    """Return list of dict dari tabel skills (dengan kolom boolean 'cursed')."""
+    return list(load_skills(path, include_cursed=include_cursed).values())
+
+
+def get_cursed_skills(path=None):
+    """Return list of dict seluruh Cursed Skills (cursed == True)."""
+    return [s for s in get_skills(path, include_cursed=True) if s.get("cursed")]
+
+
+def load_skills(path=None, include_cursed=True):
+    """Return {nama_skill: {name, cls, tier, mp_cost, cd, kind, mult, description, cursed}}
     dengan fallback konstanta seed bila database belum ter-update."""
     out = {}
     try:
         conn = get_db(path)
         try:
             for r in conn.execute(
-                    "SELECT name, cls, tier, mp_cost, cd, kind, mult, description FROM skills"):
+                    "SELECT name, cls, tier, mp_cost, cd, kind, mult, description, cursed FROM skills"):
+                is_c = bool(r["cursed"])
+                if not include_cursed and is_c:
+                    continue
                 out[r["name"]] = {
+                    "name": r["name"],
                     "cls": r["cls"] or "Universal",
                     "tier": r["tier"],
                     "mp_cost": int(r["mp_cost"]),
@@ -912,17 +1104,24 @@ def load_skills(path=None):
                     "kind": r["kind"],
                     "mult": float(r["mult"]),
                     "description": r["description"],
+                    "cursed": is_c,
                 }
         finally:
             conn.close()
     except sqlite3.Error:
         pass
-    # Pastikan seluruh 240 skill dari seed selalu tersedia
+    # Pastikan seluruh 240 skill normal dari seed selalu tersedia
     for n, (c, t, mp, cd, k, m, d) in SKILLS.items():
         out.setdefault(n, {
-            "cls": c, "tier": t, "mp_cost": mp, "cd": cd,
-            "kind": k, "mult": m, "description": d,
+            "name": n, "cls": c, "tier": t, "mp_cost": mp, "cd": cd,
+            "kind": k, "mult": m, "description": d, "cursed": False,
         })
+    if include_cursed:
+        for n, (t, mp, cd, k, m, d) in CURSED_SKILLS_POOL.items():
+            out.setdefault(n, {
+                "name": n, "cls": "Cursed", "tier": t, "mp_cost": mp, "cd": cd,
+                "kind": k, "mult": m, "description": d, "cursed": True,
+            })
     return out
 
 
@@ -1081,8 +1280,10 @@ if __name__ == "__main__":
     p = init_db(force=force, wipe_accounts=wipe)
     print("Database siap: %s" % p)
     print("  hero_names   : %d kombinasi nama" % count_names(p))
-    print("  perks        : %d perk" % len(load_perks(p)))
-    print("  skills       : %d skill" % len(load_skills(p)))
+    print("  traits       : %d trait (termasuk %d cursed)" % (
+        len(load_traits(p)), len(get_cursed_traits(p))))
+    print("  skills       : %d skill (termasuk %d cursed)" % (
+        len(load_skills(p)), len(get_cursed_skills(p))))
     print("  items_master : %d item" % len(load_items(p)))
     print("  class_stats  : %d class" % len(load_class_stats(p)))
     print("  star_mults   : %d star" % len(load_star_mults(p)))
